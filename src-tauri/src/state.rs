@@ -12,8 +12,7 @@ pub enum VaultState {
     Unlocked,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DataPlaneState {
     Stopped,
@@ -52,6 +51,8 @@ impl fmt::Display for AppStateError {
     }
 }
 
+impl std::error::Error for AppStateError {}
+
 impl AppState {
     pub fn status(&self) -> Result<AppStatus, AppStateError> {
         Ok(AppStatus {
@@ -78,6 +79,13 @@ impl AppState {
     pub fn lock_vault_payload(&self) -> Result<(), AppStateError> {
         self.set_lock_value(&self.vault_payload, None, "vault_payload")?;
         self.set_vault_state(VaultState::Locked)
+    }
+
+    pub fn set_data_plane_state(
+        &self,
+        data_plane_state: DataPlaneState,
+    ) -> Result<(), AppStateError> {
+        self.set_lock_value(&self.data_plane, data_plane_state, "data_plane")
     }
 
     #[allow(dead_code)]

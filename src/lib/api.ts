@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 
+export type CommandError = {
+  code: string;
+  message: string;
+  recoverable: boolean;
+};
+
 export type VaultState = 'missing' | 'locked' | 'unlocked';
 export type DataPlaneState = 'stopped' | 'starting' | 'running';
 
@@ -69,44 +75,188 @@ export type UserPreferences = {
   cursorStyle: 'block' | 'bar' | 'underline';
 };
 
+export type ConnectSshRequest = {
+  profileId?: string;
+  host?: string;
+  port?: number;
+  username?: string;
+  credentialRef?: string;
+  cols: number;
+  rows: number;
+};
+
+export type ConnectSshResponse = {
+  sessionId: string;
+  wsUrl: string;
+  authToken: string;
+};
+
+export type DataPlaneSession = ConnectSshResponse & {
+  expiresAt: string;
+};
+
+export type SessionResizeRequest = {
+  sessionId: string;
+  cols: number;
+  rows: number;
+};
+
+export type SessionStatus = {
+  sessionId: string;
+  state: 'connecting' | 'connected' | 'closing' | 'closed' | 'failed' | string;
+};
+
+export type SyncRequest = {
+  providerId: string;
+  direction: 'push' | 'pull' | 'bidirectional' | string;
+};
+
+export type SyncJobStatus = {
+  jobId: string;
+  state: string;
+};
+
+export type TunnelRequest = {
+  sessionId?: string;
+  profileId?: string;
+  mode: 'local' | 'remote' | 'dynamic' | string;
+  bindHost: string;
+  bindPort: number;
+  targetHost?: string;
+  targetPort?: number;
+  label?: string;
+};
+
+export type TunnelStatus = {
+  tunnelId: string;
+  sessionId: string;
+  mode: 'local' | 'remote' | 'dynamic' | string;
+  state: 'starting' | 'running' | 'stopping' | 'stopped' | 'failed' | string;
+  bindHost: string;
+  bindPort: number;
+  targetHost?: string;
+  targetPort?: number;
+  label?: string;
+  startedAt?: string;
+  lastError?: string;
+};
+
+function isCommandError(error: unknown): error is CommandError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    'message' in error &&
+    'recoverable' in error
+  );
+}
+
+function normalizeCommandError(error: unknown): CommandError {
+  if (isCommandError(error)) {
+    return {
+      code: String(error.code),
+      message: String(error.message),
+      recoverable: Boolean(error.recoverable),
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      code: 'unknown_error',
+      message: error.message,
+      recoverable: false,
+    };
+  }
+
+  return {
+    code: 'unknown_error',
+    message: String(error),
+    recoverable: false,
+  };
+}
+
+async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw normalizeCommandError(error);
+  }
+}
+
 export function getAppStatus(): Promise<AppStatus> {
-  return invoke<AppStatus>('get_app_status');
+  return invokeCommand<AppStatus>('get_app_status');
 }
 
 export function createVault(request: CreateVaultRequest): Promise<VaultStatus> {
-  return invoke<VaultStatus>('create_vault', { request });
+  return invokeCommand<VaultStatus>('create_vault', { request });
 }
 
 export function unlockVault(request: UnlockVaultRequest): Promise<VaultStatus> {
-  return invoke<VaultStatus>('unlock_vault', { request });
+  return invokeCommand<VaultStatus>('unlock_vault', { request });
 }
 
 export function lockVault(): Promise<VaultStatus> {
-  return invoke<VaultStatus>('lock_vault');
+  return invokeCommand<VaultStatus>('lock_vault');
 }
 
 export function changeMasterPassword(
   request: ChangeMasterPasswordRequest,
 ): Promise<VaultStatus> {
-  return invoke<VaultStatus>('change_master_password', { request });
+  return invokeCommand<VaultStatus>('change_master_password', { request });
 }
 
 export function listProfiles(): Promise<ConnectionProfileSummary[]> {
-  return invoke<ConnectionProfileSummary[]>('list_profiles');
+  return invokeCommand<ConnectionProfileSummary[]>('list_profiles');
 }
 
 export function saveProfile(profile: ConnectionProfileDraft): Promise<ConnectionProfile> {
-  return invoke<ConnectionProfile>('save_profile', { profile });
+  return invokeCommand<ConnectionProfile>('save_profile', { profile });
 }
 
 export function deleteProfile(id: string): Promise<DeleteResult> {
-  return invoke<DeleteResult>('delete_profile', { id });
+  return invokeCommand<DeleteResult>('delete_profile', { id });
 }
 
 export function getPreferences(): Promise<UserPreferences> {
-  return invoke<UserPreferences>('get_preferences');
+  return invokeCommand<UserPreferences>('get_preferences');
 }
 
 export function savePreferences(preferences: UserPreferences): Promise<UserPreferences> {
-  return invoke<UserPreferences>('save_preferences', { preferences });
+  return invokeCommand<UserPreferences>('save_preferences', { preferences });
+}
+
+export function openDataPlaneSession(): Promise<DataPlaneSession> {
+  return invokeCommand<DataPlaneSession>('open_data_plane_session');
+}
+
+export function connectSsh(request: ConnectSshRequest): Promise<ConnectSshResponse> {
+  return invokeCommand<ConnectSshResponse>('connect_ssh', { request });
+}
+
+export function disconnectSession(sessionId: string): Promise<SessionStatus> {
+  return invokeCommand<SessionStatus>('disconnect_session', { sessionId });
+}
+
+export function resizeSession(request: SessionResizeRequest): Promise<SessionStatus> {
+  return invokeCommand<SessionStatus>('resize_session', { request });
+}
+
+export function triggerCloudSync(request: SyncRequest): Promise<SyncJobStatus> {
+  return invokeCommand<SyncJobStatus>('trigger_cloud_sync', { request });
+}
+
+export function startTunnel(request: TunnelRequest): Promise<TunnelStatus> {
+  return invokeCommand<TunnelStatus>('start_tunnel', { request });
+}
+
+export function stopTunnel(tunnelId: string): Promise<TunnelStatus> {
+  return invokeCommand<TunnelStatus>('stop_tunnel', { tunnelId });
+}
+
+export function listTunnels(): Promise<TunnelStatus[]> {
+  return invokeCommand<TunnelStatus[]>('list_tunnels');
+}
+
+export function listSessionTunnels(sessionId: string): Promise<TunnelStatus[]> {
+  return invokeCommand<TunnelStatus[]>('list_session_tunnels', { sessionId });
 }
