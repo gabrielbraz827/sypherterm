@@ -2,15 +2,11 @@
 
 A beautiful, ultra-lightweight, and cross-platform SSH client built for developers who care about data sovereignty. Get the premium, modern UX of commercial tools like Termius, while keeping 100% control over your credentials and data.
 
----
-
 ## 👁️ The Vision
 
 Commercial SSH clients offer beautiful interfaces and seamless cloud synchronization, but they force you to trust their closed-source infrastructure with your most sensitive data—your production server credentials and private keys. 
 
 This project bridges that gap. It delivers a **hardware-accelerated, modern UI** while treating your data as your own. **No proprietary cloud accounts required.** You bring your own storage (Amazon S3, Google Drive, Supabase, etc.), and the client handles the rest locally and securely.
-
----
 
 ## 🎯 Core Principles
 
@@ -34,14 +30,6 @@ No more bloated 100MB+ Electron setups eating your RAM.
 ### 4. Gorgeous, Developer-Centric UX
 *   Modern, sleek interface featuring tab management, pane splitting (UX-driven layout), customizable themes, and vibrant typography.
 *   Built-in SFTP file manager, port forwarding (tunnels) coordinator, and snippet organizer.
-
----
-
-## 🛠️ Architecture Stack (Proposed)
-
-
-
----
 
 ## 🤝 Contributing
 

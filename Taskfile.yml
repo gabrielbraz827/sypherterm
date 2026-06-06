@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+tasks:
+  dev:
+    desc: Run the development
+    cmds:
+      - pnpm run tauri dev
+
+  build:frontend:
+    desc: Build the frontend
+    cmds:
+      - pnpm run build
+
+  build:
+    desc: Build the application
+    cmds:
+      - pnpm run tauri build
