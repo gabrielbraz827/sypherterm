@@ -36,6 +36,7 @@ pub fn run() {
             commands::list_profiles,
             commands::save_profile,
             commands::delete_profile,
+            commands::duplicate_profile,
             commands::get_preferences,
             commands::save_preferences,
             commands::open_data_plane_session,

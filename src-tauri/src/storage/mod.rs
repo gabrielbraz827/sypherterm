@@ -29,6 +29,8 @@ pub struct ConnectionProfile {
     pub credential_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,7 +61,19 @@ pub struct ConnectionProfileSummary {
     pub tags: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<String>,
     pub has_credential: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileListFilters {
+    pub query: Option<String>,
+    pub group_id: Option<String>,
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub recent_first: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,6 +181,7 @@ impl From<ConnectionProfile> for ConnectionProfileSummary {
             tags: profile.tags,
             created_at: profile.created_at,
             updated_at: profile.updated_at,
+            last_used_at: profile.last_used_at,
             has_credential: profile.credential_ref.is_some(),
         }
     }
@@ -227,19 +242,41 @@ impl ConnectionProfileDraft {
             username: normalize_optional(self.username),
             group_id: normalize_optional(self.group_id),
             tags: normalize_tags(self.tags.unwrap_or_default())?,
-            credential_ref: normalize_optional(self.credential_ref),
+            credential_ref: normalize_optional(self.credential_ref)
+                .or_else(|| existing.and_then(|profile| profile.credential_ref.clone())),
             created_at: existing
                 .map(|profile| profile.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
             updated_at: now,
+            last_used_at: existing.and_then(|profile| profile.last_used_at.clone()),
         })
     }
 }
 
 pub fn list_profiles<R: Runtime>(
     app: &AppHandle<R>,
+    filters: Option<ProfileListFilters>,
 ) -> Result<Vec<ConnectionProfileSummary>, StorageError> {
-    Ok(load_profiles(app)?
+    let filters = filters.unwrap_or_default();
+    let query = normalize_optional(filters.query).map(|query| query.to_lowercase());
+    let group_id = normalize_optional(filters.group_id);
+    let tag = normalize_optional(filters.tag);
+    let mut profiles = load_profiles(app)?;
+
+    profiles.retain(|profile| profile_matches_filters(profile, &query, &group_id, &tag));
+
+    if filters.recent_first {
+        profiles.sort_by(|left, right| {
+            right
+                .last_used_at
+                .cmp(&left.last_used_at)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+    } else {
+        profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    }
+
+    Ok(profiles
         .into_iter()
         .map(ConnectionProfileSummary::from)
         .collect())
@@ -282,6 +319,43 @@ pub fn delete_profile<R: Runtime>(
 
     save_profiles(app, &profiles)?;
     Ok(DeleteResult { deleted: true })
+}
+
+pub fn duplicate_profile<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Result<ConnectionProfile, StorageError> {
+    let mut profiles = load_profiles(app)?;
+    let Some(source) = profiles.iter().find(|profile| profile.id == id) else {
+        return Err(StorageError::not_found("profile not found"));
+    };
+    let now = timestamp();
+    let mut duplicate = source.clone();
+    duplicate.id = Uuid::new_v4().to_string();
+    duplicate.name = unique_copy_name(&profiles, &source.name);
+    duplicate.created_at = now.clone();
+    duplicate.updated_at = now;
+    duplicate.last_used_at = None;
+
+    profiles.push(duplicate.clone());
+    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    save_profiles(app, &profiles)?;
+    Ok(duplicate)
+}
+
+pub fn mark_profile_used<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+) -> Result<ConnectionProfileSummary, StorageError> {
+    let mut profiles = load_profiles(app)?;
+    let Some(profile) = profiles.iter_mut().find(|profile| profile.id == id) else {
+        return Err(StorageError::not_found("profile not found"));
+    };
+
+    profile.last_used_at = Some(timestamp());
+    let summary = ConnectionProfileSummary::from(profile.clone());
+    save_profiles(app, &profiles)?;
+    Ok(summary)
 }
 
 pub fn get_preferences<R: Runtime>(app: &AppHandle<R>) -> Result<UserPreferences, StorageError> {
@@ -346,6 +420,64 @@ fn validate_loaded_profiles(profiles: &[ConnectionProfile]) -> Result<(), Storag
     Ok(())
 }
 
+fn profile_matches_filters(
+    profile: &ConnectionProfile,
+    query: &Option<String>,
+    group_id: &Option<String>,
+    tag: &Option<String>,
+) -> bool {
+    if let Some(group_id) = group_id {
+        if profile.group_id.as_ref() != Some(group_id) {
+            return false;
+        }
+    }
+
+    if let Some(tag) = tag {
+        if !profile.tags.iter().any(|profile_tag| profile_tag == tag) {
+            return false;
+        }
+    }
+
+    let Some(query) = query else {
+        return true;
+    };
+
+    profile.name.to_lowercase().contains(query)
+        || profile.host.to_lowercase().contains(query)
+        || profile
+            .username
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(query)
+        || profile
+            .group_id
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains(query)
+        || profile
+            .tags
+            .iter()
+            .any(|tag| tag.to_lowercase().contains(query))
+}
+
+fn unique_copy_name(profiles: &[ConnectionProfile], source_name: &str) -> String {
+    let base = format!("{source_name} copy");
+    if profiles.iter().all(|profile| profile.name != base) {
+        return base;
+    }
+
+    for suffix in 2.. {
+        let candidate = format!("{base} {suffix}");
+        if profiles.iter().all(|profile| profile.name != candidate) {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix search should always return")
+}
+
 fn normalize_required(value: String, field_name: &str) -> Result<String, StorageError> {
     let value = value.trim().to_string();
     if value.is_empty() {
@@ -406,8 +538,8 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_tags, ConnectionProfileDraft, CursorStyle, StorageError, ThemePreference,
-        UserPreferences,
+        normalize_tags, profile_matches_filters, unique_copy_name, ConnectionProfile,
+        ConnectionProfileDraft, CursorStyle, StorageError, ThemePreference, UserPreferences,
     };
 
     fn valid_draft() -> ConnectionProfileDraft {
@@ -501,5 +633,59 @@ mod tests {
 
         assert_eq!(tags, vec!["alpha".to_string(), "zeta".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn editing_profile_preserves_existing_credential_ref_when_omitted() {
+        let existing = valid_draft()
+            .into_profile(None)
+            .expect("valid draft should produce profile");
+        let mut draft = valid_draft();
+        draft.id = Some(existing.id.clone());
+        draft.credential_ref = None;
+
+        let updated = draft
+            .into_profile(Some(&existing))
+            .expect("valid edit should preserve credential ref");
+
+        assert_eq!(updated.credential_ref.as_deref(), Some("vault-key"));
+    }
+
+    #[test]
+    fn profile_filters_match_query_group_and_tag() {
+        let profile = valid_draft()
+            .into_profile(None)
+            .expect("valid draft should produce profile");
+        let query = Some("prod".to_string());
+        let group = None;
+        let tag = Some("linux".to_string());
+
+        assert!(profile_matches_filters(&profile, &query, &group, &tag));
+    }
+
+    #[test]
+    fn copy_name_does_not_collide_with_existing_profiles() {
+        let profile = ConnectionProfile {
+            id: "one".to_string(),
+            version: 1,
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: None,
+            group_id: None,
+            tags: Vec::new(),
+            credential_ref: None,
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+            last_used_at: None,
+        };
+        let mut copy = profile.clone();
+        copy.id = "two".to_string();
+        copy.name = "Production copy".to_string();
+
+        assert_eq!(
+            unique_copy_name(&[profile, copy], "Production"),
+            "Production copy 2"
+        );
     }
 }

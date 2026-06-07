@@ -46,6 +46,7 @@ export type ConnectionProfile = {
   credentialRef?: string;
   createdAt: string;
   updatedAt: string;
+  lastUsedAt?: string;
 };
 
 export type ConnectionProfileDraft = {
@@ -61,6 +62,13 @@ export type ConnectionProfileDraft = {
 
 export type ConnectionProfileSummary = Omit<ConnectionProfile, 'credentialRef'> & {
   hasCredential: boolean;
+};
+
+export type ProfileListFilters = {
+  query?: string;
+  groupId?: string;
+  tag?: string;
+  recentFirst?: boolean;
 };
 
 export type DeleteResult = {
@@ -208,8 +216,11 @@ export function changeMasterPassword(
   return invokeCommand<VaultStatus>('change_master_password', { request });
 }
 
-export function listProfiles(): Promise<ConnectionProfileSummary[]> {
-  return invokeCommand<ConnectionProfileSummary[]>('list_profiles');
+export function listProfiles(filters?: ProfileListFilters): Promise<ConnectionProfileSummary[]> {
+  return invokeCommand<ConnectionProfileSummary[]>(
+    'list_profiles',
+    filters ? { filters } : undefined,
+  );
 }
 
 export function saveProfile(profile: ConnectionProfileDraft): Promise<ConnectionProfile> {
@@ -218,6 +229,10 @@ export function saveProfile(profile: ConnectionProfileDraft): Promise<Connection
 
 export function deleteProfile(id: string): Promise<DeleteResult> {
   return invokeCommand<DeleteResult>('delete_profile', { id });
+}
+
+export function duplicateProfile(id: string): Promise<ConnectionProfile> {
+  return invokeCommand<ConnectionProfile>('duplicate_profile', { id });
 }
 
 export function getPreferences(): Promise<UserPreferences> {

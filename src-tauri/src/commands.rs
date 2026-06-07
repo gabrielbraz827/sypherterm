@@ -12,10 +12,11 @@ use crate::ssh::{
 };
 use crate::state::{AppState, AppStatus};
 use crate::storage::{
-    delete_profile as delete_stored_profile, get_preferences as get_stored_preferences,
-    list_profiles as list_stored_profiles, save_preferences as save_stored_preferences,
+    delete_profile as delete_stored_profile, duplicate_profile as duplicate_stored_profile,
+    get_preferences as get_stored_preferences, list_profiles as list_stored_profiles,
+    mark_profile_used, save_preferences as save_stored_preferences,
     save_profile as save_stored_profile, ConnectionProfile, ConnectionProfileDraft,
-    ConnectionProfileSummary, DeleteResult, StorageError, UserPreferences,
+    ConnectionProfileSummary, DeleteResult, ProfileListFilters, StorageError, UserPreferences,
 };
 use crate::ws::{DataPlaneSession, StreamServer, StreamServerError};
 use serde::{Deserialize, Serialize};
@@ -183,8 +184,11 @@ pub fn change_master_password(
 }
 
 #[tauri::command]
-pub fn list_profiles(app: AppHandle) -> Result<Vec<ConnectionProfileSummary>, CommandError> {
-    list_stored_profiles(&app).map_err(Into::into)
+pub fn list_profiles(
+    app: AppHandle,
+    filters: Option<ProfileListFilters>,
+) -> Result<Vec<ConnectionProfileSummary>, CommandError> {
+    list_stored_profiles(&app, filters).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -198,6 +202,11 @@ pub fn save_profile(
 #[tauri::command]
 pub fn delete_profile(app: AppHandle, id: String) -> Result<DeleteResult, CommandError> {
     delete_stored_profile(&app, &id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn duplicate_profile(app: AppHandle, id: String) -> Result<ConnectionProfile, CommandError> {
+    duplicate_stored_profile(&app, &id).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -234,11 +243,17 @@ pub async fn open_data_plane_session(
 
 #[tauri::command]
 pub async fn connect_ssh(
+    app: AppHandle,
     server: State<'_, StreamServer>,
     ssh: State<'_, SshRegistry>,
     request: ConnectSshRequest,
 ) -> Result<ConnectSshResponse, CommandError> {
-    ssh.connect(&server, request).await.map_err(Into::into)
+    let profile_id = request.profile_id.clone();
+    let response = ssh.connect(&server, request).await?;
+    if let Some(profile_id) = profile_id {
+        let _ = mark_profile_used(&app, &profile_id);
+    }
+    Ok(response)
 }
 
 #[tauri::command]

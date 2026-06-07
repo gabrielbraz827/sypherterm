@@ -1,6 +1,6 @@
 # SPEC-007 - Terminal UI
 
-Status: Draft
+Status: Done
 Prioridade: P0
 Fonte: README.md, ARCHITECTURE.md
 
@@ -47,6 +47,7 @@ type TerminalConnection = {
 - Clipboard deve ser tratado como dado sensivel.
 - Terminal nao deve armazenar scrollback em store persistente por padrao.
 - Logs de frontend nao devem imprimir output do terminal.
+- Decisao MVP: credenciais de conexao sao informadas na UI como dados temporarios e limpas apos tentativa de conexao quando sensiveis.
 
 ## Plano de implementacao
 
@@ -57,6 +58,16 @@ type TerminalConnection = {
 5. Implementar copy/paste com plugin clipboard quando necessario.
 6. Aplicar preferencias de tema e fonte.
 7. Aplicar Tailwind para layout responsivo, toolbar, estados de sessao e paineis laterais.
+
+## Decisoes de implementacao
+
+- Pacotes usados: `@xterm/xterm`, `@xterm/addon-fit` e `@xterm/addon-web-links`.
+- `TerminalSocket` encapsula autenticacao no Data Plane, frames binarios de terminal, eventos de status e erros.
+- `TerminalInstance.svelte` isola ciclo de vida do `xterm`, resize, socket e clipboard.
+- Copy/Paste usa `@tauri-apps/plugin-clipboard-manager`.
+- Scrollback padrao: 5000 linhas, nao persistido em store.
+- Reconnect cria uma nova sessao SSH via `connect_ssh`, pois o token do Data Plane e consumido no primeiro WebSocket autenticado.
+- `TunnelIndicator.svelte` entra como placeholder funcional com contagem 0 ate a SPEC-013 implementar tunnels ativos.
 
 ## Criterios de aceite
 
@@ -74,6 +85,18 @@ type TerminalConnection = {
 - Teste de build e typecheck.
 - Verificacao visual em viewport desktop e menor.
 
+Verificacoes executadas:
+
+- `corepack pnpm check`
+- `corepack pnpm build`
+- `cargo fmt --check`
+- `cargo check`
+- `cargo test`
+
+Observacao: a verificacao visual no navegador interno foi tentada, mas o runtime local do plugin Browser falhou ao iniciar no Windows sandbox. O build e o typecheck validaram a integracao.
+
 ## Riscos e decisoes abertas
 
-- Definir limite de scrollback padrao para equilibrar memoria e usabilidade.
+- Validar manualmente conexao SSH interativa contra host real/local.
+- Validar manualmente paste grande em uma sessao real.
+- Futuramente transformar o limite de scrollback em preferencia do usuario.

@@ -1,10 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
+  import SessionStatus from './lib/components/SessionStatus.svelte';
+  import TerminalInstance from './lib/components/TerminalInstance.svelte';
+  import TerminalToolbar from './lib/components/TerminalToolbar.svelte';
+  import TunnelIndicator from './lib/components/TunnelIndicator.svelte';
   import {
     changeMasterPassword,
+    connectSsh,
     createVault,
     deleteProfile,
+    duplicateProfile,
     getAppStatus,
     getPreferences,
     lockVault,
@@ -17,6 +23,7 @@
     type UserPreferences,
     type VaultStatus,
   } from './lib/api';
+  import type { TerminalConnection } from './lib/websocket';
   import {
     appStatus as appStatusStore,
     preferences as preferencesStore,
@@ -40,6 +47,31 @@
   let profilePort = 22;
   let profileUsername = '';
   let profileTags = '';
+  let profileGroup = '';
+  let profileCredentialRef = '';
+  let editingProfileId = '';
+  let profileSearch = '';
+  let groupFilter = '';
+  let tagFilter = '';
+  let recentFirst = true;
+  let selectedProfileId = '';
+  let selectedProfile: ConnectionProfileSummary | null = null;
+  let connectUsername = '';
+  let authMode: 'password' | 'key' = 'password';
+  let sshPassword = '';
+  let privateKeyPath = '';
+  let passphrase = '';
+  let connectionError = '';
+  let isConnecting = false;
+  let terminalConnection: TerminalConnection | null = null;
+  let terminalState = 'idle';
+  let terminalMessage = '';
+  let terminalRef: {
+    copySelection: () => Promise<void>;
+    pasteClipboard: () => Promise<void>;
+    clearTerminal: () => void;
+    disconnect: () => Promise<void>;
+  } | null = null;
 
   const statusLabel: Record<AppStatus['vault'] | AppStatus['dataPlane'] | UserPreferences['theme'], string> = {
     missing: 'Missing',
@@ -61,6 +93,15 @@
     }
   });
 
+  $: selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
+  $: allGroups = Array.from(
+    new Set(profiles.map((profile) => profile.groupId).filter((group): group is string => Boolean(group))),
+  ).sort((left, right) => left.localeCompare(right));
+  $: allTags = Array.from(new Set(profiles.flatMap((profile) => profile.tags))).sort((left, right) =>
+    left.localeCompare(right),
+  );
+  $: visibleProfiles = filteredProfiles(profiles, profileSearch, groupFilter, tagFilter, recentFirst);
+
   async function loadRuntimeData() {
     const [status, storedProfiles, storedPreferences] = await Promise.all([
       getAppStatus(),
@@ -76,6 +117,10 @@
     vaultStatusStore.set(vaultStatus);
     profilesStore.set(storedProfiles);
     preferencesStore.set(storedPreferences);
+
+    if (!selectedProfileId && storedProfiles[0]) {
+      selectProfile(storedProfiles[0]);
+    }
   }
 
   async function refreshStatus() {
@@ -83,6 +128,14 @@
     vaultStatus = { state: appStatus.vault, version: vaultStatus?.version };
     appStatusStore.set(appStatus);
     vaultStatusStore.set(vaultStatus);
+  }
+
+  async function reloadProfiles() {
+    profiles = await listProfiles();
+    profilesStore.set(profiles);
+    if (selectedProfileId && !profiles.some((profile) => profile.id === selectedProfileId)) {
+      selectedProfileId = profiles[0]?.id ?? '';
+    }
   }
 
   async function submitCreateVault() {
@@ -155,24 +208,24 @@
     formError = '';
 
     try {
-      await saveProfile({
+      const savedProfile = await saveProfile({
+        id: editingProfileId || undefined,
         name: profileName,
         host: profileHost,
         port: profilePort,
         username: profileUsername || undefined,
+        groupId: profileGroup || undefined,
         tags: profileTags
           .split(',')
           .map((tag) => tag.trim())
           .filter(Boolean),
+        credentialRef: profileCredentialRef || undefined,
       });
 
-      profileName = '';
-      profileHost = '';
-      profilePort = 22;
-      profileUsername = '';
-      profileTags = '';
-      profiles = await listProfiles();
-      profilesStore.set(profiles);
+      resetProfileForm();
+      await reloadProfiles();
+      selectedProfileId = savedProfile.id;
+      connectUsername = savedProfile.username ?? '';
     } catch (error) {
       formError = formatError(error);
     }
@@ -181,12 +234,124 @@
   async function removeProfile(id: string) {
     formError = '';
 
+    if (terminalConnection && selectedProfileId === id) {
+      const shouldDelete = window.confirm('This profile has an active terminal session. Disconnect and delete it?');
+      if (!shouldDelete) {
+        return;
+      }
+      await disconnectTerminal();
+    }
+
     try {
       await deleteProfile(id);
-      profiles = await listProfiles();
-      profilesStore.set(profiles);
+      await reloadProfiles();
+      if (selectedProfileId === id) {
+        selectedProfileId = profiles[0]?.id ?? '';
+        connectUsername = profiles[0]?.username ?? '';
+      }
     } catch (error) {
       formError = formatError(error);
+    }
+  }
+
+  function editProfile(profile: ConnectionProfileSummary) {
+    editingProfileId = profile.id;
+    profileName = profile.name;
+    profileHost = profile.host;
+    profilePort = profile.port;
+    profileUsername = profile.username ?? '';
+    profileGroup = profile.groupId ?? '';
+    profileTags = profile.tags.join(', ');
+    profileCredentialRef = profile.hasCredential ? '' : '';
+    formError = '';
+  }
+
+  async function duplicateSelectedProfile(id: string) {
+    formError = '';
+
+    try {
+      const duplicated = await duplicateProfile(id);
+      await reloadProfiles();
+      selectedProfileId = duplicated.id;
+      connectUsername = duplicated.username ?? '';
+      editProfile({
+        ...duplicated,
+        hasCredential: Boolean(duplicated.credentialRef),
+      });
+    } catch (error) {
+      formError = formatError(error);
+    }
+  }
+
+  function resetProfileForm() {
+    editingProfileId = '';
+    profileName = '';
+    profileHost = '';
+    profilePort = 22;
+    profileUsername = '';
+    profileGroup = '';
+    profileTags = '';
+    profileCredentialRef = '';
+  }
+
+  function selectProfile(profile: ConnectionProfileSummary) {
+    selectedProfileId = profile.id;
+    connectUsername = profile.username ?? '';
+    connectionError = '';
+  }
+
+  async function connectSelectedProfile() {
+    if (!selectedProfile) {
+      return;
+    }
+
+    connectionError = '';
+    terminalMessage = '';
+    isConnecting = true;
+
+    try {
+      if (terminalRef) {
+        await terminalRef.disconnect();
+      }
+
+      terminalConnection = await connectSsh({
+        profileId: selectedProfile.id,
+        host: selectedProfile.host,
+        port: selectedProfile.port,
+        username: connectUsername || selectedProfile.username,
+        password: authMode === 'password' ? sshPassword || undefined : undefined,
+        privateKeyPath: authMode === 'key' ? privateKeyPath || undefined : undefined,
+        passphrase: authMode === 'key' ? passphrase || undefined : undefined,
+        cols: 80,
+        rows: 24,
+      });
+      terminalState = 'connecting';
+      sshPassword = '';
+      passphrase = '';
+      await reloadProfiles();
+      await refreshStatus();
+    } catch (error) {
+      connectionError = formatError(error);
+      terminalState = 'failed';
+      terminalMessage = connectionError;
+    } finally {
+      isConnecting = false;
+    }
+  }
+
+  async function disconnectTerminal() {
+    await terminalRef?.disconnect();
+    terminalConnection = null;
+    terminalState = 'closed';
+    await refreshStatus();
+  }
+
+  function handleTerminalStatus(event: CustomEvent<{ state: string; message?: string }>) {
+    terminalState = event.detail.state;
+    terminalMessage = event.detail.message ?? '';
+
+    if (event.detail.state === 'closed') {
+      void refreshStatus();
     }
   }
 
@@ -216,14 +381,85 @@
 
     return error instanceof Error ? error.message : String(error);
   }
+
+  function filteredProfiles(
+    source: ConnectionProfileSummary[],
+    query: string,
+    groupId: string,
+    tag: string,
+    sortRecentFirst: boolean,
+  ) {
+    const normalizedQuery = query.trim().toLowerCase();
+    const result = source.filter((profile) => {
+      if (groupId && profile.groupId !== groupId) {
+        return false;
+      }
+      if (tag && !profile.tags.includes(tag)) {
+        return false;
+      }
+      if (!normalizedQuery) {
+        return true;
+      }
+
+      return (
+        profile.name.toLowerCase().includes(normalizedQuery) ||
+        profile.host.toLowerCase().includes(normalizedQuery) ||
+        (profile.username ?? '').toLowerCase().includes(normalizedQuery) ||
+        (profile.groupId ?? '').toLowerCase().includes(normalizedQuery) ||
+        profile.tags.some((profileTag) => profileTag.toLowerCase().includes(normalizedQuery))
+      );
+    });
+
+    return [...result].sort((left, right) => {
+      if (sortRecentFirst) {
+        const recent = (right.lastUsedAt ?? '').localeCompare(left.lastUsedAt ?? '');
+        if (recent !== 0) {
+          return recent;
+        }
+      }
+      return left.name.localeCompare(right.name);
+    });
+  }
 </script>
 
 <main class="min-h-screen bg-sypher-bg text-sypher-text">
-  <section class="grid min-h-screen grid-cols-[280px_1fr]">
+  <section class="grid min-h-screen grid-cols-1 lg:grid-cols-[280px_1fr]">
     <aside class="border-r border-sypher-border bg-sypher-panel p-4">
       <div class="mb-6">
         <p class="text-xs uppercase text-sypher-muted">SypherTerm</p>
         <h1 class="mt-1 text-xl font-semibold">Local-first SSH</h1>
+      </div>
+
+      <div class="mb-4 space-y-2">
+        <input
+          class="w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+          bind:value={profileSearch}
+          placeholder="Search profiles"
+        />
+        <div class="grid grid-cols-2 gap-2">
+          <select
+            class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-2 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+            bind:value={groupFilter}
+          >
+            <option value="">All groups</option>
+            {#each allGroups as group}
+              <option value={group}>{group}</option>
+            {/each}
+          </select>
+          <select
+            class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-2 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+            bind:value={tagFilter}
+          >
+            <option value="">All tags</option>
+            {#each allTags as tag}
+              <option value={tag}>{tag}</option>
+            {/each}
+          </select>
+        </div>
+        <label class="flex items-center gap-2 text-xs text-sypher-muted">
+          <input class="h-4 w-4 accent-sypher-accent" bind:checked={recentFirst} type="checkbox" />
+          Recent first
+        </label>
       </div>
 
       <div class="space-y-3">
@@ -231,21 +467,59 @@
           <div class="rounded-panel border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-muted">
             No profiles yet
           </div>
+        {:else if visibleProfiles.length === 0}
+          <div class="rounded-panel border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-muted">
+            No matches
+          </div>
         {:else}
-          {#each profiles as profile}
-            <div class="rounded-panel border border-sypher-border bg-sypher-surface p-3">
+          {#each visibleProfiles as profile}
+            <div
+              class={`rounded-panel border p-3 ${
+                selectedProfileId === profile.id
+                  ? 'border-sypher-accent bg-sypher-surface'
+                  : 'border-sypher-border bg-sypher-surface'
+              }`}
+            >
               <div class="flex items-start justify-between gap-2">
-                <div class="min-w-0">
+                <button class="min-w-0 flex-1 text-left" type="button" on:click={() => selectProfile(profile)}>
                   <p class="truncate text-sm font-medium">{profile.name}</p>
                   <p class="truncate text-xs text-sypher-muted">{profile.username ? `${profile.username}@` : ''}{profile.host}:{profile.port}</p>
-                </div>
+                </button>
                 <button
                   class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
                   type="button"
-                  on:click={() => removeProfile(profile.id)}
+                  on:click={() => editProfile(profile)}
                 >
-                  Delete
+                  Edit
                 </button>
+              </div>
+              <div class="mt-2 flex items-center justify-between gap-2">
+                <div class="min-w-0 text-xs text-sypher-muted">
+                  {#if profile.groupId}
+                    <span>{profile.groupId}</span>
+                  {:else}
+                    <span>No group</span>
+                  {/if}
+                  {#if profile.lastUsedAt}
+                    <span> - recent</span>
+                  {/if}
+                </div>
+                <div class="flex shrink-0 gap-2">
+                  <button
+                    class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                    type="button"
+                    on:click={() => duplicateSelectedProfile(profile.id)}
+                  >
+                    Copy
+                  </button>
+                  <button
+                    class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                    type="button"
+                    on:click={() => removeProfile(profile.id)}
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
               {#if profile.tags.length}
                 <p class="mt-2 truncate text-xs text-sypher-muted">{profile.tags.join(', ')}</p>
@@ -259,27 +533,31 @@
     <section class="flex min-w-0 flex-col">
       <header class="flex h-14 items-center justify-between border-b border-sypher-border px-5">
         <div>
-          <p class="text-sm font-medium">App foundation</p>
-          <p class="text-xs text-sypher-muted">Control Plane ready for real commands</p>
+          <p class="text-sm font-medium">Terminal</p>
+          <p class="text-xs text-sypher-muted">{selectedProfile ? `${selectedProfile.host}:${selectedProfile.port}` : 'No profile selected'}</p>
         </div>
         <div class="rounded-panel border border-sypher-border bg-sypher-surface px-3 py-1 text-xs text-sypher-muted">
           v{appStatus?.appVersion ?? '...'}
         </div>
       </header>
 
-      <div class="grid flex-1 grid-cols-[1fr_360px] gap-4 p-5">
-        <section class="flex min-h-0 flex-col rounded-panel border border-sypher-border bg-black font-mono">
-          <div class="flex h-10 items-center border-b border-sypher-border px-3 text-xs text-sypher-muted">
-            terminal preview
-          </div>
-          <div class="flex flex-1 items-center justify-center p-6 text-center">
-            <div>
-              <p class="text-sm text-sypher-text">Terminal engine is not connected yet.</p>
-              <p class="mt-2 text-xs text-sypher-muted">
-                SPEC-001 exposes app status; SSH and Data Plane arrive in later specs.
-              </p>
-            </div>
-          </div>
+      <div class="grid flex-1 grid-cols-1 gap-4 p-5 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <section class="flex min-h-[420px] min-w-0 flex-col rounded-panel border border-sypher-border bg-black font-mono">
+          <TerminalToolbar
+            connected={terminalState === 'connected'}
+            busy={isConnecting || terminalState === 'connecting'}
+            on:copy={() => terminalRef?.copySelection()}
+            on:paste={() => terminalRef?.pasteClipboard()}
+            on:clear={() => terminalRef?.clearTerminal()}
+            on:reconnect={connectSelectedProfile}
+            on:disconnect={disconnectTerminal}
+          />
+          <TerminalInstance
+            bind:this={terminalRef}
+            connection={terminalConnection}
+            preferences={preferences}
+            on:status={handleTerminalStatus}
+          />
         </section>
 
         <aside class="rounded-panel border border-sypher-border bg-sypher-panel p-4">
@@ -313,6 +591,101 @@
           {:else}
             <p class="mt-4 text-sm text-sypher-muted">Loading status...</p>
           {/if}
+
+          <div class="mt-6 grid grid-cols-2 gap-2">
+            <SessionStatus state={terminalState} message={terminalMessage} />
+            <TunnelIndicator activeCount={0} />
+          </div>
+
+          <div class="mt-6 border-t border-sypher-border pt-4">
+            <h2 class="text-sm font-semibold">Connection</h2>
+
+            {#if selectedProfile}
+              <form class="mt-4 space-y-3" on:submit|preventDefault={connectSelectedProfile}>
+                <div class="rounded-panel border border-sypher-border bg-sypher-surface p-3 text-sm">
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="truncate font-medium">{selectedProfile.name}</span>
+                    <span class="shrink-0 text-xs text-sypher-muted">{selectedProfile.host}:{selectedProfile.port}</span>
+                  </div>
+                </div>
+
+                <label class="block text-xs text-sypher-muted">
+                  Username
+                  <input
+                    class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={connectUsername}
+                    autocomplete="username"
+                    placeholder="deploy"
+                  />
+                </label>
+
+                <div class="grid grid-cols-2 gap-2 rounded-panel border border-sypher-border bg-sypher-surface p-1">
+                  <button
+                    class={`rounded px-3 py-2 text-xs ${authMode === 'password' ? 'bg-sypher-accent text-sypher-bg' : 'text-sypher-muted hover:text-sypher-text'}`}
+                    type="button"
+                    on:click={() => (authMode = 'password')}
+                  >
+                    Password
+                  </button>
+                  <button
+                    class={`rounded px-3 py-2 text-xs ${authMode === 'key' ? 'bg-sypher-accent text-sypher-bg' : 'text-sypher-muted hover:text-sypher-text'}`}
+                    type="button"
+                    on:click={() => (authMode = 'key')}
+                  >
+                    Key
+                  </button>
+                </div>
+
+                {#if authMode === 'password'}
+                  <label class="block text-xs text-sypher-muted">
+                    Password
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={sshPassword}
+                      type="password"
+                      autocomplete="current-password"
+                    />
+                  </label>
+                {:else}
+                  <label class="block text-xs text-sypher-muted">
+                    Private key path
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={privateKeyPath}
+                      placeholder="C:/Users/me/.ssh/id_ed25519"
+                    />
+                  </label>
+                  <label class="block text-xs text-sypher-muted">
+                    Passphrase
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={passphrase}
+                      type="password"
+                      autocomplete="current-password"
+                    />
+                  </label>
+                {/if}
+
+                {#if connectionError}
+                  <p class="rounded-panel border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
+                    {connectionError}
+                  </p>
+                {/if}
+
+                <button
+                  class="w-full rounded-panel bg-sypher-accent px-3 py-2 text-sm font-semibold text-sypher-bg disabled:opacity-50"
+                  type="submit"
+                  disabled={isConnecting}
+                >
+                  {isConnecting ? 'Connecting...' : 'Connect'}
+                </button>
+              </form>
+            {:else}
+              <p class="mt-4 rounded-panel border border-sypher-border bg-sypher-surface p-3 text-sm text-sypher-muted">
+                No profile selected
+              </p>
+            {/if}
+          </div>
 
           <div class="mt-6 border-t border-sypher-border pt-4">
             <h2 class="text-sm font-semibold">Vault</h2>
@@ -419,14 +792,25 @@
 
           <div class="mt-6 border-t border-sypher-border pt-4">
             <div class="flex items-center justify-between">
-              <h2 class="text-sm font-semibold">Local profile</h2>
-              <button
-                class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
-                type="button"
-                on:click={cycleTheme}
-              >
-                Cycle theme
-              </button>
+              <h2 class="text-sm font-semibold">{editingProfileId ? 'Edit profile' : 'New profile'}</h2>
+              <div class="flex gap-2">
+                {#if editingProfileId}
+                  <button
+                    class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                    type="button"
+                    on:click={resetProfileForm}
+                  >
+                    New
+                  </button>
+                {/if}
+                <button
+                  class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                  type="button"
+                  on:click={cycleTheme}
+                >
+                  Theme
+                </button>
+              </div>
             </div>
 
             <form class="mt-4 space-y-3" on:submit|preventDefault={submitProfile}>
@@ -471,11 +855,29 @@
               </div>
 
               <label class="block text-xs text-sypher-muted">
+                Group
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={profileGroup}
+                  placeholder="Production"
+                />
+              </label>
+
+              <label class="block text-xs text-sypher-muted">
                 Tags
                 <input
                   class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
                   bind:value={profileTags}
                   placeholder="prod, linux"
+                />
+              </label>
+
+              <label class="block text-xs text-sypher-muted">
+                Credential ref
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={profileCredentialRef}
+                  placeholder="vault://profile-key"
                 />
               </label>
 
@@ -489,7 +891,7 @@
                 class="w-full rounded-panel bg-sypher-accent px-3 py-2 text-sm font-semibold text-sypher-bg"
                 type="submit"
               >
-                Save profile
+                {editingProfileId ? 'Update profile' : 'Save profile'}
               </button>
             </form>
           </div>
