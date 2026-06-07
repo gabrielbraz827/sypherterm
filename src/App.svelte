@@ -1,9 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  import SessionStatus from './lib/components/SessionStatus.svelte';
-  import TerminalInstance from './lib/components/TerminalInstance.svelte';
-  import TerminalToolbar from './lib/components/TerminalToolbar.svelte';
+  import TerminalPane from './lib/components/TerminalPane.svelte';
   import TunnelIndicator from './lib/components/TunnelIndicator.svelte';
   import {
     changeMasterPassword,
@@ -23,6 +21,27 @@
     type UserPreferences,
     type VaultStatus,
   } from './lib/api';
+  import {
+    addTab,
+    clearPaneSession,
+    closePane,
+    closeTab,
+    collectPaneIds,
+    createDefaultLayout,
+    flattenTerminalPanes,
+    getActivePaneId,
+    getActiveTab,
+    loadSessionLayout,
+    persistSessionLayout,
+    primarySplitDirection,
+    renameActiveTab,
+    setActivePane,
+    setActiveTab,
+    splitPane,
+    updatePaneSession,
+    type SessionLayout,
+    type TerminalTab,
+  } from './lib/layout';
   import type { TerminalConnection } from './lib/websocket';
   import {
     appStatus as appStatusStore,
@@ -63,15 +82,10 @@
   let passphrase = '';
   let connectionError = '';
   let isConnecting = false;
-  let terminalConnection: TerminalConnection | null = null;
-  let terminalState = 'idle';
-  let terminalMessage = '';
-  let terminalRef: {
-    copySelection: () => Promise<void>;
-    pasteClipboard: () => Promise<void>;
-    clearTerminal: () => void;
-    disconnect: () => Promise<void>;
-  } | null = null;
+  let sessionLayout: SessionLayout = createDefaultLayout();
+  let layoutReady = false;
+  let paneConnections: Record<string, TerminalConnection | undefined> = {};
+  let paneStatuses: Record<string, { state: string; message?: string }> = {};
 
   const statusLabel: Record<AppStatus['vault'] | AppStatus['dataPlane'] | UserPreferences['theme'], string> = {
     missing: 'Missing',
@@ -87,6 +101,8 @@
 
   onMount(async () => {
     try {
+      sessionLayout = loadSessionLayout();
+      layoutReady = true;
       await loadRuntimeData();
     } catch (error) {
       loadError = error instanceof Error ? error.message : String(error);
@@ -94,6 +110,12 @@
   });
 
   $: selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
+  $: activeTab = getActiveTab(sessionLayout);
+  $: activePaneId = getActivePaneId(sessionLayout);
+  $: activePaneStatus = paneStatuses[activePaneId] ?? { state: 'idle', message: '' };
+  $: if (layoutReady) {
+    persistSessionLayout(sessionLayout);
+  }
   $: allGroups = Array.from(
     new Set(profiles.map((profile) => profile.groupId).filter((group): group is string => Boolean(group))),
   ).sort((left, right) => left.localeCompare(right));
@@ -234,12 +256,12 @@
   async function removeProfile(id: string) {
     formError = '';
 
-    if (terminalConnection && selectedProfileId === id) {
+    if (profileHasActivePane(id)) {
       const shouldDelete = window.confirm('This profile has an active terminal session. Disconnect and delete it?');
       if (!shouldDelete) {
         return;
       }
-      await disconnectTerminal();
+      closePanesForProfile(id);
     }
 
     try {
@@ -305,16 +327,20 @@
       return;
     }
 
+    const paneId = activePaneId;
+    if (!paneId) {
+      return;
+    }
+
     connectionError = '';
-    terminalMessage = '';
     isConnecting = true;
+    paneStatuses = {
+      ...paneStatuses,
+      [paneId]: { state: 'connecting', message: '' },
+    };
 
     try {
-      if (terminalRef) {
-        await terminalRef.disconnect();
-      }
-
-      terminalConnection = await connectSsh({
+      const connection = await connectSsh({
         profileId: selectedProfile.id,
         host: selectedProfile.host,
         port: selectedProfile.port,
@@ -325,34 +351,114 @@
         cols: 80,
         rows: 24,
       });
-      terminalState = 'connecting';
+      paneConnections = {
+        ...paneConnections,
+        [paneId]: connection,
+      };
+      sessionLayout = updatePaneSession(sessionLayout, paneId, connection.sessionId, selectedProfile.name);
       sshPassword = '';
       passphrase = '';
       await reloadProfiles();
       await refreshStatus();
     } catch (error) {
       connectionError = formatError(error);
-      terminalState = 'failed';
-      terminalMessage = connectionError;
+      paneStatuses = {
+        ...paneStatuses,
+        [paneId]: { state: 'failed', message: connectionError },
+      };
     } finally {
       isConnecting = false;
     }
   }
 
-  async function disconnectTerminal() {
-    await terminalRef?.disconnect();
-    terminalConnection = null;
-    terminalState = 'closed';
-    await refreshStatus();
+  function addSessionTab() {
+    sessionLayout = addTab(sessionLayout);
   }
 
-  function handleTerminalStatus(event: CustomEvent<{ state: string; message?: string }>) {
-    terminalState = event.detail.state;
-    terminalMessage = event.detail.message ?? '';
+  function activateTab(tabId: string) {
+    sessionLayout = setActiveTab(sessionLayout, tabId);
+  }
+
+  function renameCurrentTab() {
+    const tab = getActiveTab(sessionLayout);
+    const title = window.prompt('Tab title', tab?.title ?? '');
+    if (title !== null) {
+      sessionLayout = renameActiveTab(sessionLayout, title);
+    }
+  }
+
+  function closeSessionTab(tab: TerminalTab) {
+    const paneIds = collectPaneIds(tab.rootPane);
+    const hasConnections = paneIds.some((paneId) => paneConnections[paneId]);
+    if (hasConnections && !window.confirm('Close this tab and disconnect its panes?')) {
+      return;
+    }
+
+    const nextConnections = { ...paneConnections };
+    const nextStatuses = { ...paneStatuses };
+    for (const paneId of paneIds) {
+      delete nextConnections[paneId];
+      delete nextStatuses[paneId];
+    }
+    paneConnections = nextConnections;
+    paneStatuses = nextStatuses;
+    sessionLayout = closeTab(sessionLayout, tab.id);
+    void refreshStatus();
+  }
+
+  function focusPane(paneId: string) {
+    sessionLayout = setActivePane(sessionLayout, paneId);
+  }
+
+  function splitActivePane(paneId: string, direction: 'horizontal' | 'vertical') {
+    sessionLayout = splitPane(setActivePane(sessionLayout, paneId), paneId, direction);
+  }
+
+  function closeTerminalPane(paneId: string) {
+    if (paneConnections[paneId] && !window.confirm('Close this pane and disconnect its SSH session?')) {
+      return;
+    }
+
+    const nextConnections = { ...paneConnections };
+    const nextStatuses = { ...paneStatuses };
+    delete nextConnections[paneId];
+    delete nextStatuses[paneId];
+    paneConnections = nextConnections;
+    paneStatuses = nextStatuses;
+    sessionLayout = closePane(sessionLayout, paneId);
+    void refreshStatus();
+  }
+
+  function handlePaneDisconnected(paneId: string) {
+    const nextConnections = { ...paneConnections };
+    delete nextConnections[paneId];
+    paneConnections = nextConnections;
+    paneStatuses = {
+      ...paneStatuses,
+      [paneId]: { state: 'closed', message: '' },
+    };
+    sessionLayout = clearPaneSession(sessionLayout, paneId);
+    void refreshStatus();
+  }
+
+  function handlePaneStatus(event: CustomEvent<{ paneId: string; state: string; message?: string }>) {
+    paneStatuses = {
+      ...paneStatuses,
+      [event.detail.paneId]: {
+        state: event.detail.state,
+        message: event.detail.message ?? '',
+      },
+    };
 
     if (event.detail.state === 'closed') {
+      sessionLayout = clearPaneSession(sessionLayout, event.detail.paneId);
       void refreshStatus();
     }
+  }
+
+  function reconnectPane(paneId: string) {
+    sessionLayout = setActivePane(sessionLayout, paneId);
+    void connectSelectedProfile();
   }
 
   async function cycleTheme() {
@@ -419,6 +525,45 @@
       }
       return left.name.localeCompare(right.name);
     });
+  }
+
+  function tabGridClass(tab: TerminalTab) {
+    const panes = flattenTerminalPanes(tab.rootPane);
+    if (panes.length <= 1) {
+      return 'grid-cols-1';
+    }
+
+    return primarySplitDirection(tab.rootPane) === 'vertical'
+      ? 'grid-cols-1 grid-rows-2'
+      : 'grid-cols-1 lg:grid-cols-2';
+  }
+
+  function profileHasActivePane(profileId: string) {
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (!profile) {
+      return false;
+    }
+
+    return Object.values(paneConnections).some((connection) =>
+      Boolean(connection && sessionLayout.tabs.some((tab) =>
+        flattenTerminalPanes(tab.rootPane).some((pane) => pane.sessionId === connection.sessionId && pane.title === profile.name),
+      )),
+    );
+  }
+
+  function closePanesForProfile(profileId: string) {
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (!profile) {
+      return;
+    }
+
+    for (const tab of sessionLayout.tabs) {
+      for (const pane of flattenTerminalPanes(tab.rootPane)) {
+        if (pane.title === profile.name) {
+          closeTerminalPane(pane.paneId);
+        }
+      }
+    }
   }
 </script>
 
@@ -533,8 +678,10 @@
     <section class="flex min-w-0 flex-col">
       <header class="flex h-14 items-center justify-between border-b border-sypher-border px-5">
         <div>
-          <p class="text-sm font-medium">Terminal</p>
-          <p class="text-xs text-sypher-muted">{selectedProfile ? `${selectedProfile.host}:${selectedProfile.port}` : 'No profile selected'}</p>
+          <p class="text-sm font-medium">{activeTab?.title ?? 'Terminal'}</p>
+          <p class="text-xs text-sypher-muted">
+            {selectedProfile ? `${selectedProfile.host}:${selectedProfile.port}` : 'No profile selected'}
+          </p>
         </div>
         <div class="rounded-panel border border-sypher-border bg-sypher-surface px-3 py-1 text-xs text-sypher-muted">
           v{appStatus?.appVersion ?? '...'}
@@ -542,22 +689,76 @@
       </header>
 
       <div class="grid flex-1 grid-cols-1 gap-4 p-5 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <section class="flex min-h-[420px] min-w-0 flex-col rounded-panel border border-sypher-border bg-black font-mono">
-          <TerminalToolbar
-            connected={terminalState === 'connected'}
-            busy={isConnecting || terminalState === 'connecting'}
-            on:copy={() => terminalRef?.copySelection()}
-            on:paste={() => terminalRef?.pasteClipboard()}
-            on:clear={() => terminalRef?.clearTerminal()}
-            on:reconnect={connectSelectedProfile}
-            on:disconnect={disconnectTerminal}
-          />
-          <TerminalInstance
-            bind:this={terminalRef}
-            connection={terminalConnection}
-            preferences={preferences}
-            on:status={handleTerminalStatus}
-          />
+        <section class="flex min-h-[520px] min-w-0 flex-col rounded-panel border border-sypher-border bg-sypher-bg">
+          <div class="flex min-h-12 items-center justify-between gap-3 border-b border-sypher-border px-3 py-2">
+            <div class="flex min-w-0 flex-1 gap-2 overflow-x-auto">
+              {#each sessionLayout.tabs as tab}
+                <button
+                  class={`min-w-0 rounded border px-3 py-2 text-left text-xs ${
+                    sessionLayout.activeTabId === tab.id
+                      ? 'border-sypher-accent bg-sypher-surface text-sypher-text'
+                      : 'border-sypher-border bg-sypher-panel text-sypher-muted'
+                  }`}
+                  type="button"
+                  on:click={() => activateTab(tab.id)}
+                >
+                  <span class="block max-w-36 truncate">{tab.title}</span>
+                </button>
+              {/each}
+            </div>
+            <div class="flex shrink-0 gap-2">
+              <button
+                class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                type="button"
+                on:click={addSessionTab}
+              >
+                New tab
+              </button>
+              <button
+                class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                type="button"
+                on:click={renameCurrentTab}
+              >
+                Rename
+              </button>
+              {#if activeTab}
+                <button
+                  class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                  type="button"
+                  on:click={() => closeSessionTab(activeTab)}
+                >
+                  Close tab
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          <div class="relative min-h-0 flex-1">
+            {#each sessionLayout.tabs as tab (tab.id)}
+              <div
+                class={`absolute inset-0 grid gap-3 p-3 ${tabGridClass(tab)} ${
+                  sessionLayout.activeTabId === tab.id ? '' : 'pointer-events-none hidden'
+                }`}
+              >
+                {#each flattenTerminalPanes(tab.rootPane) as pane (pane.paneId)}
+                  <TerminalPane
+                    {pane}
+                    active={activePaneId === pane.paneId && sessionLayout.activeTabId === tab.id}
+                    connection={paneConnections[pane.paneId]}
+                    {preferences}
+                    state={paneStatuses[pane.paneId]?.state ?? 'idle'}
+                    message={paneStatuses[pane.paneId]?.message ?? ''}
+                    on:focus={(event) => focusPane(event.detail.paneId)}
+                    on:split={(event) => splitActivePane(event.detail.paneId, event.detail.direction)}
+                    on:close={(event) => closeTerminalPane(event.detail.paneId)}
+                    on:reconnect={(event) => reconnectPane(event.detail.paneId)}
+                    on:disconnected={(event) => handlePaneDisconnected(event.detail.paneId)}
+                    on:status={handlePaneStatus}
+                  />
+                {/each}
+              </div>
+            {/each}
+          </div>
         </section>
 
         <aside class="rounded-panel border border-sypher-border bg-sypher-panel p-4">
@@ -593,7 +794,12 @@
           {/if}
 
           <div class="mt-6 grid grid-cols-2 gap-2">
-            <SessionStatus state={terminalState} message={terminalMessage} />
+            <div class="rounded-panel border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-muted">
+              <div class="flex items-center justify-between gap-3">
+                <span>Pane</span>
+                <span class="truncate text-sypher-text">{activePaneStatus.state}</span>
+              </div>
+            </div>
             <TunnelIndicator activeCount={0} />
           </div>
 
