@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -24,6 +24,26 @@ pub struct DataPlaneSession {
     pub ws_url: String,
     pub auth_token: String,
     pub expires_at: String,
+}
+
+#[derive(Debug)]
+pub enum DataPlaneClientMessage {
+    Binary(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+    Close,
+}
+
+#[derive(Debug)]
+pub enum DataPlaneServerMessage {
+    Binary(Vec<u8>),
+    Status {
+        state: String,
+    },
+    Error {
+        code: String,
+        message: String,
+        recoverable: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -54,10 +74,12 @@ pub struct StreamServer {
     pending: Arc<Mutex<HashMap<String, PendingSession>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingSession {
     session_id: String,
     expires_at: Instant,
+    client_tx: mpsc::UnboundedSender<DataPlaneClientMessage>,
+    server_rx: mpsc::UnboundedReceiver<DataPlaneServerMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +89,13 @@ struct AuthFrame {
     #[serde(default, rename = "type")]
     frame_type: Option<String>,
     token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResizeFrame {
+    cols: u16,
+    rows: u16,
 }
 
 impl StreamServer {
@@ -94,10 +123,29 @@ impl StreamServer {
         format!("ws://{}", self.addr)
     }
 
-    pub async fn register_session(&self) -> DataPlaneSession {
+    pub async fn register_session(
+        &self,
+    ) -> (
+        DataPlaneSession,
+        mpsc::UnboundedReceiver<DataPlaneClientMessage>,
+        mpsc::UnboundedSender<DataPlaneServerMessage>,
+    ) {
         let session_id = Uuid::new_v4().to_string();
+        self.register_session_with_id(session_id).await
+    }
+
+    pub async fn register_session_with_id(
+        &self,
+        session_id: String,
+    ) -> (
+        DataPlaneSession,
+        mpsc::UnboundedReceiver<DataPlaneClientMessage>,
+        mpsc::UnboundedSender<DataPlaneServerMessage>,
+    ) {
         let auth_token = generate_token();
         let expires_at = Instant::now() + SESSION_TTL;
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
 
         let mut pending = self.pending.lock().await;
         cleanup_expired(&mut pending);
@@ -106,22 +154,28 @@ impl StreamServer {
             PendingSession {
                 session_id: session_id.clone(),
                 expires_at,
+                client_tx,
+                server_rx,
             },
         );
         drop(pending);
 
-        DataPlaneSession {
-            session_id,
-            ws_url: self.ws_url(),
-            auth_token,
-            expires_at: unix_timestamp_after(SESSION_TTL),
-        }
+        (
+            DataPlaneSession {
+                session_id,
+                ws_url: self.ws_url(),
+                auth_token,
+                expires_at: unix_timestamp_after(SESSION_TTL),
+            },
+            client_rx,
+            server_tx,
+        )
     }
 
-    async fn consume_token(&self, token: &str) -> Option<String> {
+    async fn consume_token(&self, token: &str) -> Option<PendingSession> {
         let mut pending = self.pending.lock().await;
         cleanup_expired(&mut pending);
-        pending.remove(token).map(|session| session.session_id)
+        pending.remove(token)
     }
 
     #[cfg(test)]
@@ -170,7 +224,7 @@ async fn handle_connection(
         return;
     };
 
-    let Some(session_id) = server.consume_token(&token).await else {
+    let Some(mut pending_session) = server.consume_token(&token).await else {
         let _ = send_error(&mut ws_stream, "invalid_token", "invalid or expired token").await;
         return;
     };
@@ -180,35 +234,38 @@ async fn handle_connection(
         serde_json::json!({
             "event": "status",
             "state": "connected",
-            "sessionId": session_id,
+            "sessionId": pending_session.session_id,
         }),
     )
     .await;
-
-    while let Some(message) = ws_stream.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if value.get("event").and_then(|event| event.as_str()) == Some("heartbeat") {
-                        let _ = send_json(
-                            &mut ws_stream,
-                            serde_json::json!({
-                                "event": "heartbeat",
-                                "ts": timestamp(),
-                            }),
-                        )
-                        .await;
-                    }
+    loop {
+        tokio::select! {
+            Some(server_message) = pending_session.server_rx.recv() => {
+                if send_server_message(&mut ws_stream, server_message).await.is_err() {
+                    break;
                 }
             }
-            Ok(Message::Binary(bytes)) => {
-                // SPEC-005 validates binary frame flow before SSH piping exists.
-                let _ = ws_stream.send(Message::Binary(bytes)).await;
+            Some(message) = ws_stream.next() => {
+                match message {
+                    Ok(Message::Text(text)) => {
+                        if handle_text_message(&mut ws_stream, &pending_session.client_tx, &text).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Binary(bytes)) => {
+                        let _ = pending_session.client_tx.send(DataPlaneClientMessage::Binary(bytes.to_vec()));
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
             }
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+            else => break,
         }
     }
+
+    let _ = pending_session
+        .client_tx
+        .send(DataPlaneClientMessage::Close);
 }
 
 fn parse_auth_token(message: Message) -> Option<String> {
@@ -241,6 +298,82 @@ async fn send_error(
         }),
     )
     .await
+}
+
+async fn send_server_message(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    message: DataPlaneServerMessage,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    match message {
+        DataPlaneServerMessage::Binary(bytes) => {
+            ws_stream.send(Message::Binary(bytes.into())).await
+        }
+        DataPlaneServerMessage::Status { state } => {
+            send_json(
+                ws_stream,
+                serde_json::json!({
+                    "event": "status",
+                    "state": state,
+                }),
+            )
+            .await
+        }
+        DataPlaneServerMessage::Error {
+            code,
+            message,
+            recoverable,
+        } => {
+            send_json(
+                ws_stream,
+                serde_json::json!({
+                    "event": "error",
+                    "code": code,
+                    "message": message,
+                    "recoverable": recoverable,
+                }),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_text_message(
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    client_tx: &mpsc::UnboundedSender<DataPlaneClientMessage>,
+    text: &str,
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(());
+    };
+
+    match value.get("event").and_then(|event| event.as_str()) {
+        Some("heartbeat") => {
+            send_json(
+                ws_stream,
+                serde_json::json!({
+                    "event": "heartbeat",
+                    "ts": timestamp(),
+                }),
+            )
+            .await
+        }
+        Some("resize") => {
+            if let Ok(resize) = serde_json::from_value::<ResizeFrame>(value) {
+                let _ = client_tx.send(DataPlaneClientMessage::Resize {
+                    cols: resize.cols,
+                    rows: resize.rows,
+                });
+            }
+            Ok(())
+        }
+        Some("input") => {
+            if let Some(data) = value.get("data").and_then(|data| data.as_str()) {
+                let _ = client_tx.send(DataPlaneClientMessage::Binary(data.as_bytes().to_vec()));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 async fn send_json(
@@ -304,8 +437,8 @@ mod tests {
         let server = StreamServer::start()
             .await
             .expect("stream server should start");
-        let first = server.register_session().await;
-        let second = server.register_session().await;
+        let (first, _, _) = server.register_session().await;
+        let (second, _, _) = server.register_session().await;
 
         assert_ne!(first.session_id, second.session_id);
         assert_ne!(first.auth_token, second.auth_token);
@@ -317,7 +450,7 @@ mod tests {
         let server = StreamServer::start()
             .await
             .expect("stream server should start");
-        let session = server.register_session().await;
+        let (session, _, _) = server.register_session().await;
         let (mut socket, _) = connect_async(&session.ws_url)
             .await
             .expect("websocket should connect");

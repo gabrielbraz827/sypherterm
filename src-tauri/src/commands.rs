@@ -6,6 +6,10 @@ use crate::crypto::{
     vault_status as stored_vault_status, ChangeMasterPasswordRequest, CreateVaultRequest,
     UnlockVaultRequest, VaultError, VaultStatus,
 };
+use crate::ssh::{
+    ConnectSshRequest, ConnectSshResponse, SessionResizeRequest, SessionStatus, SshError,
+    SshRegistry,
+};
 use crate::state::{AppState, AppStatus};
 use crate::storage::{
     delete_profile as delete_stored_profile, get_preferences as get_stored_preferences,
@@ -70,49 +74,10 @@ impl From<StreamServerError> for CommandError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectSshRequest {
-    #[allow(dead_code)]
-    pub profile_id: Option<String>,
-    #[allow(dead_code)]
-    pub host: Option<String>,
-    #[allow(dead_code)]
-    pub port: Option<u16>,
-    #[allow(dead_code)]
-    pub username: Option<String>,
-    #[allow(dead_code)]
-    pub credential_ref: Option<String>,
-    #[allow(dead_code)]
-    pub cols: u16,
-    #[allow(dead_code)]
-    pub rows: u16,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConnectSshResponse {
-    pub session_id: String,
-    pub ws_url: String,
-    pub auth_token: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionResizeRequest {
-    #[allow(dead_code)]
-    pub session_id: String,
-    #[allow(dead_code)]
-    pub cols: u16,
-    #[allow(dead_code)]
-    pub rows: u16,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionStatus {
-    pub session_id: String,
-    pub state: String,
+impl From<SshError> for CommandError {
+    fn from(error: SshError) -> Self {
+        Self::new(error.code, error.message, error.recoverable)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -174,12 +139,15 @@ pub struct TunnelStatus {
 }
 
 #[tauri::command]
-pub fn get_app_status(
+pub async fn get_app_status(
     app: AppHandle,
     state: State<'_, AppState>,
+    ssh: State<'_, SshRegistry>,
 ) -> Result<AppStatus, CommandError> {
     let _ = stored_vault_status(&app, &state)?;
-    state.status().map_err(Into::into)
+    let mut status = state.status()?;
+    status.active_sessions = ssh.active_count().await;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -249,28 +217,44 @@ pub fn save_preferences(
 pub async fn open_data_plane_session(
     server: State<'_, StreamServer>,
 ) -> Result<DataPlaneSession, CommandError> {
-    Ok(server.register_session().await)
+    let (session, mut client_rx, server_tx) = server.register_session().await;
+    tokio::spawn(async move {
+        while let Some(message) = client_rx.recv().await {
+            match message {
+                crate::ws::DataPlaneClientMessage::Binary(bytes) => {
+                    let _ = server_tx.send(crate::ws::DataPlaneServerMessage::Binary(bytes));
+                }
+                crate::ws::DataPlaneClientMessage::Resize { .. } => {}
+                crate::ws::DataPlaneClientMessage::Close => break,
+            }
+        }
+    });
+    Ok(session)
 }
 
 #[tauri::command]
-pub fn connect_ssh(request: ConnectSshRequest) -> Result<ConnectSshResponse, CommandError> {
-    let _ = request;
-    Err(CommandError::not_implemented("SSH connections"))
+pub async fn connect_ssh(
+    server: State<'_, StreamServer>,
+    ssh: State<'_, SshRegistry>,
+    request: ConnectSshRequest,
+) -> Result<ConnectSshResponse, CommandError> {
+    ssh.connect(&server, request).await.map_err(Into::into)
 }
 
 #[tauri::command]
-pub fn disconnect_session(session_id: String) -> Result<SessionStatus, CommandError> {
-    Err(CommandError::not_found(format!(
-        "session {session_id} is not active"
-    )))
+pub async fn disconnect_session(
+    ssh: State<'_, SshRegistry>,
+    session_id: String,
+) -> Result<SessionStatus, CommandError> {
+    ssh.disconnect(&session_id).await.map_err(Into::into)
 }
 
 #[tauri::command]
-pub fn resize_session(request: SessionResizeRequest) -> Result<SessionStatus, CommandError> {
-    Err(CommandError::not_found(format!(
-        "session {} is not active",
-        request.session_id
-    )))
+pub async fn resize_session(
+    ssh: State<'_, SshRegistry>,
+    request: SessionResizeRequest,
+) -> Result<SessionStatus, CommandError> {
+    ssh.resize(request).await.map_err(Into::into)
 }
 
 #[tauri::command]

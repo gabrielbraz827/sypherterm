@@ -12,6 +12,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .manage(state::AppState::default())
+        .manage(ssh::SshRegistry::default())
         .setup(|app| {
             let app_state = app.state::<state::AppState>();
             app_state.set_data_plane_state(state::DataPlaneState::Starting)?;

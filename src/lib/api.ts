@@ -81,6 +81,9 @@ export type ConnectSshRequest = {
   port?: number;
   username?: string;
   credentialRef?: string;
+  password?: string;
+  privateKeyPath?: string;
+  passphrase?: string;
   cols: number;
   rows: number;
 };
