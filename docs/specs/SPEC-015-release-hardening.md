@@ -1,6 +1,6 @@
 # SPEC-015 - Release hardening
 
-Status: Draft
+Status: Implementada
 Prioridade: P2
 Fonte: README.md, ARCHITECTURE.md
 
@@ -32,6 +32,8 @@ Antes de releases publicos, o SypherTerm precisa ter builds confiaveis, permisso
 | Frontend build | `pnpm build` |
 | Svelte check | `pnpm check` |
 | Tauri build | `pnpm tauri build` |
+| npm audit | `pnpm audit:npm` |
+| Rust audit | `pnpm audit:rust` |
 
 ## Seguranca e privacidade
 
@@ -41,11 +43,11 @@ Antes de releases publicos, o SypherTerm precisa ter builds confiaveis, permisso
 
 ## Plano de implementacao
 
-1. Criar workflow CI para Windows, Linux e macOS.
-2. Adicionar scripts de check em `package.json`.
-3. Adicionar auditoria Rust e npm.
-4. Criar checklist em `docs/release/CHECKLIST.md`.
-5. Definir processo de assinatura quando canal de distribuicao for escolhido.
+1. [x] Criar workflow CI para Windows, Linux e macOS.
+2. [x] Adicionar scripts de check em `package.json`.
+3. [x] Adicionar auditoria Rust e npm.
+4. [x] Criar checklist em `docs/release/CHECKLIST.md`.
+5. [ ] Definir processo de assinatura quando canal de distribuicao for escolhido.
 
 ## Criterios de aceite
 
@@ -63,3 +65,15 @@ Antes de releases publicos, o SypherTerm precisa ter builds confiaveis, permisso
 ## Riscos e decisoes abertas
 
 - Assinatura e auto-update dependem do canal de distribuicao escolhido.
+
+## Implementacao
+
+- Workflow criado em `.github/workflows/ci.yml` com matriz `ubuntu-22.04`, `macos-latest` e `windows-latest`.
+- CI executa `pnpm check`, `pnpm test:unit`, `pnpm build`, `pnpm check:rust`, `pnpm test:rust` e `pnpm build:tauri`.
+- Auditoria roda em job separado com `pnpm audit:npm` e `pnpm audit:rust`; `cargo-audit` e instalado no CI.
+- `packageManager` fixado em `pnpm@11.2.2`, alinhado ao Corepack local e compativel com `pnpm-lock.yaml` lockfile v9.
+- Checklist criado em `docs/release/CHECKLIST.md`.
+- Revisao de capabilities documentada em `docs/release/CAPABILITIES.md`.
+- Notas de auditoria documentadas em `docs/release/DEPENDENCY_AUDIT.md`.
+- Decisao: `RUSTSEC-2023-0071` e temporariamente ignorado por vir de `rsa` via `russh`/`ssh-key` sem upgrade corrigido disponivel na stack atual; deve ser reavaliado antes de release publico.
+- `.gitignore` passou a cobrir artefatos Tauri e arquivos locais sensiveis (`*.local.json`, `*.vault`, `*.key`, `*.pem`, `*.p12`).
