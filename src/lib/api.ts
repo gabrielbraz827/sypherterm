@@ -117,6 +117,56 @@ export type SessionStatus = {
   state: 'connecting' | 'connected' | 'closing' | 'closed' | 'failed' | string;
 };
 
+export type RemoteEntryKind = 'directory' | 'file' | 'symlink' | 'other';
+
+export type RemoteDirEntry = {
+  name: string;
+  path: string;
+  kind: RemoteEntryKind;
+  size: number;
+  permissions?: string;
+  modifiedAt?: string;
+};
+
+export type SftpPathRequest = {
+  sessionId: string;
+  path: string;
+};
+
+export type SftpTransferRequest = {
+  sessionId: string;
+  remotePath: string;
+  localPath: string;
+};
+
+export type SftpRenameRequest = {
+  sessionId: string;
+  oldPath: string;
+  newPath: string;
+};
+
+export type SftpDeleteRequest = {
+  sessionId: string;
+  path: string;
+  kind?: RemoteEntryKind;
+};
+
+export type SftpCancelRequest = {
+  jobId: string;
+};
+
+export type TransferJob = {
+  jobId: string;
+  sessionId: string;
+  direction: 'download' | 'upload';
+  state: 'running' | 'completed' | 'cancelled' | 'failed';
+  remotePath: string;
+  localPath: string;
+  bytesTransferred: number;
+  totalBytes?: number;
+  message?: string;
+};
+
 export type SyncRequest = {
   providerId: string;
   direction: 'push' | 'pull' | 'bidirectional' | string;
@@ -284,6 +334,34 @@ export function disconnectSession(sessionId: string): Promise<SessionStatus> {
 
 export function resizeSession(request: SessionResizeRequest): Promise<SessionStatus> {
   return invokeCommand<SessionStatus>('resize_session', { request });
+}
+
+export function sftpListDir(request: SftpPathRequest): Promise<RemoteDirEntry[]> {
+  return invokeCommand<RemoteDirEntry[]>('sftp_list_dir', { request });
+}
+
+export function sftpDownload(request: SftpTransferRequest): Promise<TransferJob> {
+  return invokeCommand<TransferJob>('sftp_download', { request });
+}
+
+export function sftpUpload(request: SftpTransferRequest): Promise<TransferJob> {
+  return invokeCommand<TransferJob>('sftp_upload', { request });
+}
+
+export function sftpCancelTransfer(request: SftpCancelRequest): Promise<TransferJob> {
+  return invokeCommand<TransferJob>('sftp_cancel_transfer', { request });
+}
+
+export function sftpMkdir(request: SftpPathRequest): Promise<RemoteDirEntry> {
+  return invokeCommand<RemoteDirEntry>('sftp_mkdir', { request });
+}
+
+export function sftpRename(request: SftpRenameRequest): Promise<RemoteDirEntry> {
+  return invokeCommand<RemoteDirEntry>('sftp_rename', { request });
+}
+
+export function sftpDelete(request: SftpDeleteRequest): Promise<RemoteDirEntry> {
+  return invokeCommand<RemoteDirEntry>('sftp_delete', { request });
 }
 
 export function triggerCloudSync(request: SyncRequest): Promise<SyncJobStatus> {

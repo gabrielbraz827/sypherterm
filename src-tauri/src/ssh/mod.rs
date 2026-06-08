@@ -2,6 +2,7 @@ use crate::ws::{DataPlaneClientMessage, DataPlaneServerMessage, DataPlaneSession
 use russh::client;
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::{ChannelMsg, Disconnect};
+use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -146,6 +147,7 @@ pub struct SshRegistry {
 struct SshSessionEntry {
     state: SessionLifecycle,
     control_tx: mpsc::UnboundedSender<SshControl>,
+    target: NormalizedConnectRequest,
 }
 
 #[derive(Debug)]
@@ -225,8 +227,13 @@ impl SshRegistry {
             .register_session_with_id(session_id.clone())
             .await;
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        self.insert_session(&session_id, SessionLifecycle::Connected, control_tx)
-            .await;
+        self.insert_session(
+            &session_id,
+            SessionLifecycle::Connected,
+            control_tx,
+            target.clone(),
+        )
+        .await;
 
         let registry = self.clone();
         let task_session_id = session_id.clone();
@@ -282,15 +289,48 @@ impl SshRegistry {
         })
     }
 
+    pub async fn open_sftp(&self, session_id: &str) -> Result<SftpSession, SshError> {
+        let Some(entry) = self.sessions.lock().await.get(session_id).cloned() else {
+            return Err(SshError::not_found(session_id));
+        };
+        if entry.state != SessionLifecycle::Connected {
+            return Err(SshError::new(
+                "session_unavailable",
+                "SSH session is not connected",
+                true,
+            ));
+        }
+
+        let mut ssh_handle = connect_client(&entry.target).await?;
+        authenticate_client(&mut ssh_handle, &entry.target).await?;
+        let channel = ssh_handle
+            .channel_open_session()
+            .await
+            .map_err(map_russh_error)?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(map_russh_error)?;
+
+        SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|error| SshError::new("sftp_error", error.to_string(), true))
+    }
+
     async fn insert_session(
         &self,
         session_id: &str,
         state: SessionLifecycle,
         control_tx: mpsc::UnboundedSender<SshControl>,
+        target: NormalizedConnectRequest,
     ) {
         self.sessions.lock().await.insert(
             session_id.to_string(),
-            SshSessionEntry { state, control_tx },
+            SshSessionEntry {
+                state,
+                control_tx,
+                target,
+            },
         );
     }
 

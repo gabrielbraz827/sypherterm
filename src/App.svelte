@@ -16,13 +16,22 @@
     listProfiles,
     savePreferences,
     saveProfile,
+    sftpCancelTransfer,
+    sftpDelete,
+    sftpDownload,
+    sftpListDir,
+    sftpMkdir,
+    sftpRename,
+    sftpUpload,
     testSyncProvider,
     triggerCloudSync,
     unlockVault,
     type AppStatus,
     type ConnectionProfileSummary,
+    type RemoteDirEntry,
     type SyncProviderConfig,
     type SyncVersion,
+    type TransferJob,
     type UserPreferences,
     type VaultStatus,
   } from './lib/api';
@@ -54,11 +63,13 @@
     profiles as profilesStore,
     vaultStatus as vaultStatusStore,
   } from './lib/store';
+  import { getNativeOsInfo, notifyNativeEvent, type NativeOsInfo } from './lib/native';
 
   let appStatus: AppStatus | null = null;
   let vaultStatus: VaultStatus | null = null;
   let profiles: ConnectionProfileSummary[] = [];
   let preferences: UserPreferences | null = null;
+  let nativeOsInfo: NativeOsInfo | null = null;
   let loadError = '';
   let formError = '';
   let vaultError = '';
@@ -70,6 +81,18 @@
   let syncError = '';
   let syncVersions: SyncVersion[] = [];
   let isSyncing = false;
+  let sftpPath = '.';
+  let sftpEntries: RemoteDirEntry[] = [];
+  let sftpError = '';
+  let sftpMessage = '';
+  let sftpLocalPath = '';
+  let sftpRemotePath = '';
+  let sftpNewDirectoryPath = '';
+  let sftpSelectedPath = '';
+  let sftpRenamePath = '';
+  let sftpSelectedKind: RemoteDirEntry['kind'] | undefined = undefined;
+  let sftpJob: TransferJob | null = null;
+  let isSftpBusy = false;
   let masterPassword = '';
   let currentPassword = '';
   let newPassword = '';
@@ -114,6 +137,7 @@
   onMount(async () => {
     try {
       sessionLayout = loadSessionLayout();
+      nativeOsInfo = getNativeOsInfo();
       layoutReady = true;
       await loadRuntimeData();
     } catch (error) {
@@ -124,6 +148,10 @@
   $: selectedProfile = profiles.find((profile) => profile.id === selectedProfileId) ?? null;
   $: activeTab = getActiveTab(sessionLayout);
   $: activePaneId = getActivePaneId(sessionLayout);
+  $: activePane = activeTab
+    ? flattenTerminalPanes(activeTab.rootPane).find((pane) => pane.paneId === activePaneId)
+    : undefined;
+  $: activeSessionId = activePane?.sessionId ?? '';
   $: activePaneStatus = paneStatuses[activePaneId] ?? { state: 'idle', message: '' };
   $: if (layoutReady) {
     persistSessionLayout(sessionLayout);
@@ -370,10 +398,12 @@
       sessionLayout = updatePaneSession(sessionLayout, paneId, connection.sessionId, selectedProfile.name);
       sshPassword = '';
       passphrase = '';
+      void notifyNativeEvent('connection:connected', 'SSH session connected.');
       await reloadProfiles();
       await refreshStatus();
     } catch (error) {
       connectionError = formatError(error);
+      void notifyNativeEvent('connection:failed', 'SSH session failed.');
       paneStatuses = {
         ...paneStatuses,
         [paneId]: { state: 'failed', message: connectionError },
@@ -541,10 +571,15 @@
       syncMessage = [status.state, status.message, status.versionId ? `Version ${status.versionId}` : '']
         .filter(Boolean)
         .join(' - ');
+      void notifyNativeEvent('sync:completed', `Sync ${status.state}.`);
       await loadSyncVersionList(false);
       await refreshStatus();
     } catch (error) {
       syncError = formatError(error);
+      void notifyNativeEvent(
+        commandErrorCode(error) === 'conflict_detected' ? 'sync:conflict' : 'sync:failed',
+        commandErrorCode(error) === 'conflict_detected' ? 'Sync conflict detected.' : 'Sync failed.',
+      );
     } finally {
       isSyncing = false;
     }
@@ -567,12 +602,195 @@
     }
   }
 
+  function requireActiveSftpSession() {
+    if (!activeSessionId) {
+      sftpError = 'Select a connected terminal session first.';
+      return '';
+    }
+
+    return activeSessionId;
+  }
+
+  async function loadSftpDirectory(path = sftpPath) {
+    sftpError = '';
+    sftpMessage = '';
+    const sessionId = requireActiveSftpSession();
+    if (!sessionId) {
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      sftpEntries = await sftpListDir({ sessionId, path });
+      sftpPath = path;
+      sftpSelectedPath = '';
+      sftpSelectedKind = undefined;
+      sftpRenamePath = '';
+      sftpMessage = `${sftpEntries.length} remote item(s)`;
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function createSftpDirectory() {
+    sftpError = '';
+    const sessionId = requireActiveSftpSession();
+    const path = sftpNewDirectoryPath.trim();
+    if (!sessionId || !path) {
+      sftpError = sftpError || 'Directory path is required.';
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      await sftpMkdir({ sessionId, path });
+      sftpNewDirectoryPath = '';
+      sftpMessage = 'Directory created.';
+      await loadSftpDirectory(sftpPath);
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function renameSftpEntry() {
+    sftpError = '';
+    const sessionId = requireActiveSftpSession();
+    const newPath = sftpRenamePath.trim();
+    if (!sessionId || !sftpSelectedPath || !newPath) {
+      sftpError = sftpError || 'Select an item and provide the new remote path.';
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      await sftpRename({ sessionId, oldPath: sftpSelectedPath, newPath });
+      sftpMessage = 'Remote item renamed.';
+      await loadSftpDirectory(sftpPath);
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function deleteSftpEntry() {
+    sftpError = '';
+    const sessionId = requireActiveSftpSession();
+    if (!sessionId || !sftpSelectedPath) {
+      sftpError = sftpError || 'Select a remote item first.';
+      return;
+    }
+
+    if (!window.confirm('Delete the selected remote item?')) {
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      await sftpDelete({ sessionId, path: sftpSelectedPath, kind: sftpSelectedKind });
+      sftpMessage = 'Remote item deleted.';
+      await loadSftpDirectory(sftpPath);
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function downloadSftpFile() {
+    sftpError = '';
+    const sessionId = requireActiveSftpSession();
+    const remotePath = (sftpRemotePath || sftpSelectedPath).trim();
+    const localPath = sftpLocalPath.trim();
+    if (!sessionId || !remotePath || !localPath) {
+      sftpError = sftpError || 'Remote and local paths are required.';
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      sftpJob = await sftpDownload({ sessionId, remotePath, localPath });
+      sftpMessage = `Download ${sftpJob.state}.`;
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function uploadSftpFile() {
+    sftpError = '';
+    const sessionId = requireActiveSftpSession();
+    const remotePath = sftpRemotePath.trim();
+    const localPath = sftpLocalPath.trim();
+    if (!sessionId || !remotePath || !localPath) {
+      sftpError = sftpError || 'Remote and local paths are required.';
+      return;
+    }
+
+    isSftpBusy = true;
+    try {
+      sftpJob = await sftpUpload({ sessionId, remotePath, localPath });
+      sftpMessage = `Upload ${sftpJob.state}.`;
+      await loadSftpDirectory(sftpPath);
+    } catch (error) {
+      sftpError = formatError(error);
+    } finally {
+      isSftpBusy = false;
+    }
+  }
+
+  async function cancelSftpTransfer() {
+    if (!sftpJob) {
+      return;
+    }
+
+    try {
+      sftpJob = await sftpCancelTransfer({ jobId: sftpJob.jobId });
+      sftpMessage = `Transfer ${sftpJob.state}.`;
+    } catch (error) {
+      sftpError = formatError(error);
+    }
+  }
+
+  function selectSftpEntry(entry: RemoteDirEntry) {
+    sftpSelectedPath = entry.path;
+    sftpSelectedKind = entry.kind;
+    sftpRenamePath = entry.path;
+    sftpRemotePath = entry.path;
+  }
+
+  function sftpProgress(job: TransferJob | null) {
+    if (!job) {
+      return '';
+    }
+
+    if (!job.totalBytes) {
+      return `${job.bytesTransferred} bytes`;
+    }
+
+    const percent = Math.round((job.bytesTransferred / job.totalBytes) * 100);
+    return `${percent}% - ${job.bytesTransferred}/${job.totalBytes} bytes`;
+  }
+
   function formatError(error: unknown) {
     if (typeof error === 'object' && error && 'message' in error) {
       return String(error.message);
     }
 
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function commandErrorCode(error: unknown) {
+    if (typeof error === 'object' && error && 'code' in error) {
+      return String(error.code);
+    }
+
+    return '';
   }
 
   function shortHash(value: string) {
@@ -889,6 +1107,12 @@
                   <dd>{statusLabel[preferences.theme]}</dd>
                 </div>
               {/if}
+              {#if nativeOsInfo}
+                <div class="flex items-center justify-between">
+                  <dt class="text-sypher-muted">Platform</dt>
+                  <dd>{nativeOsInfo.platform}</dd>
+                </div>
+              {/if}
             </dl>
           {:else}
             <p class="mt-4 text-sm text-sypher-muted">Loading status...</p>
@@ -990,6 +1214,162 @@
             {:else}
               <p class="mt-4 rounded-panel border border-sypher-border bg-sypher-surface p-3 text-sm text-sypher-muted">
                 No profile selected
+              </p>
+            {/if}
+          </div>
+
+          <div class="mt-6 border-t border-sypher-border pt-4">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold">SFTP</h2>
+              <span class="max-w-36 truncate text-xs text-sypher-muted">{activeSessionId || 'No session'}</span>
+            </div>
+
+            <div class="mt-4 space-y-3">
+              <label class="block text-xs text-sypher-muted">
+                Remote directory
+                <div class="mt-1 grid grid-cols-[1fr_auto] gap-2">
+                  <input
+                    class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={sftpPath}
+                    placeholder="/home/deploy"
+                  />
+                  <button
+                    class="rounded-panel bg-sypher-accent px-3 py-2 text-xs font-semibold text-sypher-bg disabled:opacity-50"
+                    type="button"
+                    disabled={isSftpBusy || !activeSessionId}
+                    on:click={() => loadSftpDirectory()}
+                  >
+                    List
+                  </button>
+                </div>
+              </label>
+
+              {#if sftpEntries.length > 0}
+                <div class="max-h-44 space-y-2 overflow-y-auto rounded-panel border border-sypher-border bg-sypher-surface p-2">
+                  {#each sftpEntries as entry}
+                    <button
+                      class={`block w-full rounded border px-2 py-2 text-left text-xs ${
+                        sftpSelectedPath === entry.path
+                          ? 'border-sypher-accent text-sypher-text'
+                          : 'border-sypher-border text-sypher-muted'
+                      }`}
+                      type="button"
+                      on:click={() => selectSftpEntry(entry)}
+                      on:dblclick={() => entry.kind === 'directory' && loadSftpDirectory(entry.path)}
+                    >
+                      <span class="flex items-center justify-between gap-2">
+                        <span class="truncate">{entry.kind === 'directory' ? '[dir] ' : ''}{entry.name}</span>
+                        <span class="shrink-0">{entry.kind === 'file' ? `${entry.size}b` : entry.kind}</span>
+                      </span>
+                      <span class="mt-1 block truncate">{entry.path}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+
+              <div class="grid grid-cols-[1fr_auto] gap-2">
+                <input
+                  class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={sftpNewDirectoryPath}
+                  placeholder="/remote/new-dir"
+                />
+                <button
+                  class="rounded border border-sypher-border px-3 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  disabled={isSftpBusy || !activeSessionId}
+                  on:click={createSftpDirectory}
+                >
+                  Mkdir
+                </button>
+              </div>
+
+              <div class="grid grid-cols-[1fr_auto_auto] gap-2">
+                <input
+                  class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={sftpRenamePath}
+                  placeholder="/remote/new-name"
+                />
+                <button
+                  class="rounded border border-sypher-border px-3 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  disabled={isSftpBusy || !sftpSelectedPath}
+                  on:click={renameSftpEntry}
+                >
+                  Rename
+                </button>
+                <button
+                  class="rounded border border-red-900/60 px-3 py-2 text-xs text-red-200 disabled:opacity-50"
+                  type="button"
+                  disabled={isSftpBusy || !sftpSelectedPath}
+                  on:click={deleteSftpEntry}
+                >
+                  Delete
+                </button>
+              </div>
+
+              <label class="block text-xs text-sypher-muted">
+                Remote file path
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={sftpRemotePath}
+                  placeholder="/remote/file.txt"
+                />
+              </label>
+
+              <label class="block text-xs text-sypher-muted">
+                Local file path
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={sftpLocalPath}
+                  placeholder="C:/Users/me/file.txt"
+                />
+              </label>
+
+              <div class="grid grid-cols-3 gap-2">
+                <button
+                  class="rounded-panel border border-sypher-border px-2 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  disabled={isSftpBusy || !activeSessionId}
+                  on:click={downloadSftpFile}
+                >
+                  Download
+                </button>
+                <button
+                  class="rounded-panel border border-sypher-border px-2 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  disabled={isSftpBusy || !activeSessionId}
+                  on:click={uploadSftpFile}
+                >
+                  Upload
+                </button>
+                <button
+                  class="rounded-panel border border-sypher-border px-2 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  disabled={!sftpJob || sftpJob.state !== 'running'}
+                  on:click={cancelSftpTransfer}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+
+            {#if sftpJob}
+              <div class="mt-3 rounded-panel border border-sypher-border bg-sypher-surface p-2 text-xs text-sypher-muted">
+                <div class="flex items-center justify-between gap-2">
+                  <span>{sftpJob.direction}</span>
+                  <span>{sftpJob.state}</span>
+                </div>
+                <p class="mt-1 truncate">{sftpProgress(sftpJob)}</p>
+              </div>
+            {/if}
+
+            {#if sftpError}
+              <p class="mt-3 rounded-panel border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
+                {sftpError}
+              </p>
+            {:else if sftpMessage}
+              <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
+                {sftpMessage}
               </p>
             {/if}
           </div>

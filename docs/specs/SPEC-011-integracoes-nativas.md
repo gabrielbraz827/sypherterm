@@ -1,6 +1,6 @@
 # SPEC-011 - Integracoes nativas
 
-Status: Draft
+Status: Done
 Prioridade: P1
 Fonte: ARCHITECTURE.md
 
@@ -47,6 +47,14 @@ SypherTerm usa plugins Tauri para clipboard, notificacoes, opener, OS info, stor
 4. Integrar clipboard ao terminal.
 5. Integrar notificacoes a eventos de sync/conexao.
 
+## Implementacao entregue
+
+- `src/lib/native.ts` centraliza clipboard, notificacoes, OS info e opener.
+- Clipboard do terminal passou a usar o wrapper nativo, sem persistir historico no app.
+- Notificacoes foram integradas a conexao SSH e sync com mensagens sanitizadas.
+- `docs/NATIVE_PERMISSIONS.md` documenta cada permissao de `src-tauri/capabilities/default.json`.
+- O Runtime status mostra a plataforma via plugin OS.
+
 ## Criterios de aceite
 
 - Cada permissao tem uso documentado.
@@ -59,7 +67,11 @@ SypherTerm usa plugins Tauri para clipboard, notificacoes, opener, OS info, stor
 - Teste manual de copy/paste.
 - Teste manual de notificacao.
 - Revisao de capabilities.
+- Unit tests para sanitizacao de notificacoes.
 
 ## Riscos e decisoes abertas
 
 - Diferencas de comportamento entre Windows, macOS e Linux.
+- Decisao: `websocket:default` permanece habilitado por estar previsto na arquitetura, mas o Data Plane continua usando WebSocket nativo do browser contra o servidor local autenticado.
+- Decisao: `opener:default` fica atras de wrapper que permite URLs `http/https` e paths apenas quando informados por acao explicita.
+- Risco: permissoes de notificacao dependem de comportamento do sistema operacional e precisam validacao manual por plataforma.

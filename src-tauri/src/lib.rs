@@ -1,5 +1,6 @@
 mod commands;
 mod crypto;
+mod sftp;
 mod ssh;
 mod state;
 mod storage;
@@ -12,6 +13,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .manage(state::AppState::default())
+        .manage(sftp::SftpRegistry::default())
         .manage(ssh::SshRegistry::default())
         .setup(|app| {
             let app_state = app.state::<state::AppState>();
@@ -43,6 +45,13 @@ pub fn run() {
             commands::connect_ssh,
             commands::disconnect_session,
             commands::resize_session,
+            commands::sftp_list_dir,
+            commands::sftp_download,
+            commands::sftp_upload,
+            commands::sftp_cancel_transfer,
+            commands::sftp_mkdir,
+            commands::sftp_rename,
+            commands::sftp_delete,
             commands::test_sync_provider,
             commands::trigger_cloud_sync,
             commands::list_sync_versions,

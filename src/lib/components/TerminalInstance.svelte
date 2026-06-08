@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
   import { FitAddon } from '@xterm/addon-fit';
   import { WebLinksAddon } from '@xterm/addon-web-links';
   import { Terminal } from '@xterm/xterm';
@@ -7,6 +6,7 @@
   import { createEventDispatcher, onMount } from 'svelte';
 
   import { disconnectSession, resizeSession, type UserPreferences } from '../api';
+  import { copyTerminalSelection, readTerminalClipboard } from '../native';
   import {
     TerminalSocket,
     type TerminalConnection,
@@ -62,11 +62,11 @@
       return;
     }
 
-    await writeText(selection);
+    await copyTerminalSelection(selection);
   }
 
   export async function pasteClipboard() {
-    const text = await readText();
+    const text = await readTerminalClipboard();
     if (!text) {
       return;
     }

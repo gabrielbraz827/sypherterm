@@ -6,6 +6,10 @@ use crate::crypto::{
     vault_status as stored_vault_status, ChangeMasterPasswordRequest, CreateVaultRequest,
     UnlockVaultRequest, VaultError, VaultStatus,
 };
+use crate::sftp::{
+    RemoteDirEntry, SftpCancelRequest, SftpDeleteRequest, SftpError, SftpPathRequest, SftpRegistry,
+    SftpRenameRequest, SftpTransferRequest, TransferJob,
+};
 use crate::ssh::{
     ConnectSshRequest, ConnectSshResponse, SessionResizeRequest, SessionStatus, SshError,
     SshRegistry,
@@ -80,6 +84,12 @@ impl From<SshError> for CommandError {
 
 impl From<SyncError> for CommandError {
     fn from(error: SyncError) -> Self {
+        Self::new(error.code, error.message, error.recoverable)
+    }
+}
+
+impl From<SftpError> for CommandError {
+    fn from(error: SftpError) -> Self {
         Self::new(error.code, error.message, error.recoverable)
     }
 }
@@ -257,6 +267,68 @@ pub async fn resize_session(
     request: SessionResizeRequest,
 ) -> Result<SessionStatus, CommandError> {
     ssh.resize(request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_list_dir(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpPathRequest,
+) -> Result<Vec<RemoteDirEntry>, CommandError> {
+    sftp.list_dir(&ssh, request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_download(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpTransferRequest,
+) -> Result<TransferJob, CommandError> {
+    sftp.download(&ssh, request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_upload(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpTransferRequest,
+) -> Result<TransferJob, CommandError> {
+    sftp.upload(&ssh, request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_cancel_transfer(
+    sftp: State<'_, SftpRegistry>,
+    request: SftpCancelRequest,
+) -> Result<TransferJob, CommandError> {
+    sftp.cancel_transfer(request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_mkdir(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpPathRequest,
+) -> Result<RemoteDirEntry, CommandError> {
+    sftp.mkdir(&ssh, request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_rename(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpRenameRequest,
+) -> Result<RemoteDirEntry, CommandError> {
+    sftp.rename(&ssh, request).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn sftp_delete(
+    ssh: State<'_, SshRegistry>,
+    sftp: State<'_, SftpRegistry>,
+    request: SftpDeleteRequest,
+) -> Result<RemoteDirEntry, CommandError> {
+    sftp.delete(&ssh, request).await.map_err(Into::into)
 }
 
 #[tauri::command]
