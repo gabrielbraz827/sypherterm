@@ -99,10 +99,19 @@ impl CryptoEngine {
         encrypt_payload_with_created_at(data, master_password, timestamp())
     }
 
+    #[cfg(test)]
     pub fn decrypt_payload(
         envelope: &VaultEnvelope,
         master_password: &str,
     ) -> Result<Vec<u8>, VaultError> {
+        let (payload, _) = Self::decrypt_payload_and_key(envelope, master_password)?;
+        Ok(payload)
+    }
+
+    pub fn decrypt_payload_and_key(
+        envelope: &VaultEnvelope,
+        master_password: &str,
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; KEY_LEN]>), VaultError> {
         validate_envelope(envelope)?;
         let salt = decode_base64(&envelope.kdf.salt_base64)?;
         let nonce = decode_base64(&envelope.cipher.nonce_base64)?;
@@ -112,9 +121,11 @@ impl CryptoEngine {
         let cipher = Aes256Gcm::new_from_slice(&key[..])
             .map_err(|_| VaultError::crypto_error("failed to initialize AES-256-GCM cipher"))?;
 
-        cipher
+        let payload = cipher
             .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-            .map_err(|_| VaultError::invalid_password("master password is invalid"))
+            .map_err(|_| VaultError::invalid_password("master password is invalid"))?;
+
+        Ok((payload, key))
     }
 }
 
@@ -134,9 +145,10 @@ pub fn create_vault<R: Runtime>(
 
     validate_master_password(&request.master_password)?;
     let envelope = CryptoEngine::encrypt_payload(INITIAL_VAULT_PAYLOAD, &request.master_password)?;
+    let key = key_for_envelope(&envelope, &request.master_password)?;
     store.set(VAULT_KEY, serde_json::to_value(&envelope)?);
     store.save()?;
-    state.unlock_vault_payload(INITIAL_VAULT_PAYLOAD.to_vec())?;
+    state.unlock_vault_secret(INITIAL_VAULT_PAYLOAD.to_vec(), key)?;
 
     Ok(VaultStatus {
         state: VaultState::Unlocked,
@@ -151,8 +163,9 @@ pub fn unlock_vault<R: Runtime>(
 ) -> Result<VaultStatus, VaultError> {
     let envelope = load_envelope(app)?
         .ok_or_else(|| VaultError::new("vault_missing", "vault has not been created", true))?;
-    let payload = CryptoEngine::decrypt_payload(&envelope, &request.master_password)?;
-    state.unlock_vault_payload(payload)?;
+    let (payload, key) =
+        CryptoEngine::decrypt_payload_and_key(&envelope, &request.master_password)?;
+    state.unlock_vault_secret(payload, key)?;
 
     Ok(VaultStatus {
         state: VaultState::Unlocked,
@@ -182,13 +195,14 @@ pub fn change_master_password<R: Runtime>(
     validate_master_password(&request.new_password)?;
     let envelope = load_envelope(app)?
         .ok_or_else(|| VaultError::new("vault_missing", "vault has not been created", true))?;
-    let payload = CryptoEngine::decrypt_payload(&envelope, &request.current_password)?;
+    let (payload, _) = CryptoEngine::decrypt_payload_and_key(&envelope, &request.current_password)?;
     let updated_envelope =
         encrypt_payload_with_created_at(&payload, &request.new_password, envelope.created_at)?;
+    let key = key_for_envelope(&updated_envelope, &request.new_password)?;
     let store = app.store(STORE_PATH)?;
     store.set(VAULT_KEY, serde_json::to_value(&updated_envelope)?);
     store.save()?;
-    state.unlock_vault_payload(payload)?;
+    state.unlock_vault_secret(payload, key)?;
 
     Ok(VaultStatus {
         state: VaultState::Unlocked,
@@ -245,6 +259,28 @@ pub fn import_vault_envelope<R: Runtime>(
     })
 }
 
+pub fn replace_vault_payload<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    payload: Vec<u8>,
+) -> Result<VaultStatus, VaultError> {
+    let envelope = load_envelope(app)?
+        .ok_or_else(|| VaultError::new("vault_missing", "vault has not been created", true))?;
+    let key = state
+        .vault_key()?
+        .ok_or_else(|| VaultError::new("vault_locked", "vault is locked", true))?;
+    let updated_envelope = encrypt_payload_with_key(&payload, &key, &envelope)?;
+    let store = app.store(STORE_PATH)?;
+    store.set(VAULT_KEY, serde_json::to_value(&updated_envelope)?);
+    store.save()?;
+    state.update_vault_payload(payload)?;
+
+    Ok(VaultStatus {
+        state: VaultState::Unlocked,
+        version: Some(updated_envelope.version),
+    })
+}
+
 fn encrypt_payload_with_created_at(
     data: &[u8],
     master_password: &str,
@@ -285,6 +321,46 @@ fn encrypt_payload_with_created_at(
     })
 }
 
+fn encrypt_payload_with_key(
+    data: &[u8],
+    key: &[u8; KEY_LEN],
+    existing: &VaultEnvelope,
+) -> Result<VaultEnvelope, VaultError> {
+    validate_envelope(existing)?;
+    let salt = decode_base64(&existing.kdf.salt_base64)?;
+    validate_salt_length(&salt)?;
+
+    let mut nonce = [0_u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| VaultError::crypto_error("failed to initialize AES-256-GCM cipher"))?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), data)
+        .map_err(|_| VaultError::crypto_error("failed to encrypt vault payload"))?;
+
+    Ok(VaultEnvelope {
+        version: VAULT_VERSION,
+        kdf: existing.kdf.clone(),
+        cipher: CipherPayload {
+            algorithm: "aes-256-gcm".to_string(),
+            nonce_base64: STANDARD.encode(nonce),
+            ciphertext_base64: STANDARD.encode(ciphertext),
+        },
+        created_at: existing.created_at.clone(),
+        updated_at: timestamp(),
+    })
+}
+
+fn key_for_envelope(
+    envelope: &VaultEnvelope,
+    master_password: &str,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    validate_envelope(envelope)?;
+    let salt = decode_base64(&envelope.kdf.salt_base64)?;
+    validate_salt_length(&salt)?;
+    derive_key(master_password, &salt, &envelope.kdf)
+}
+
 fn derive_key(
     master_password: &str,
     salt: &[u8],
@@ -320,12 +396,18 @@ fn validate_envelope(envelope: &VaultEnvelope) -> Result<(), VaultError> {
 }
 
 fn validate_decoded_lengths(salt: &[u8], nonce: &[u8]) -> Result<(), VaultError> {
-    if salt.len() != SALT_LEN {
-        return Err(VaultError::crypto_error("vault salt has invalid length"));
-    }
+    validate_salt_length(salt)?;
 
     if nonce.len() != NONCE_LEN {
         return Err(VaultError::crypto_error("vault nonce has invalid length"));
+    }
+
+    Ok(())
+}
+
+fn validate_salt_length(salt: &[u8]) -> Result<(), VaultError> {
+    if salt.len() != SALT_LEN {
+        return Err(VaultError::crypto_error("vault salt has invalid length"));
     }
 
     Ok(())

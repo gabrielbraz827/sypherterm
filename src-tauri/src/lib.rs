@@ -1,10 +1,12 @@
 mod commands;
 mod crypto;
 mod sftp;
+mod snippets;
 mod ssh;
 mod state;
 mod storage;
 mod sync;
+mod tunnel;
 mod ws;
 
 use tauri::Manager;
@@ -15,6 +17,7 @@ pub fn run() {
         .manage(state::AppState::default())
         .manage(sftp::SftpRegistry::default())
         .manage(ssh::SshRegistry::default())
+        .manage(tunnel::TunnelRegistry::default())
         .setup(|app| {
             let app_state = app.state::<state::AppState>();
             app_state.set_data_plane_state(state::DataPlaneState::Starting)?;
@@ -41,6 +44,10 @@ pub fn run() {
             commands::duplicate_profile,
             commands::get_preferences,
             commands::save_preferences,
+            commands::list_snippets,
+            commands::get_snippet,
+            commands::save_snippet,
+            commands::delete_snippet,
             commands::open_data_plane_session,
             commands::connect_ssh,
             commands::disconnect_session,

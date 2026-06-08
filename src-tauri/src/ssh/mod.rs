@@ -317,6 +317,42 @@ impl SshRegistry {
             .map_err(|error| SshError::new("sftp_error", error.to_string(), true))
     }
 
+    pub async fn open_direct_tcpip(
+        &self,
+        session_id: &str,
+        host_to_connect: &str,
+        port_to_connect: u16,
+        originator_address: &str,
+        originator_port: u16,
+    ) -> Result<russh::Channel<client::Msg>, SshError> {
+        let Some(entry) = self.sessions.lock().await.get(session_id).cloned() else {
+            return Err(SshError::not_found(session_id));
+        };
+        if entry.state != SessionLifecycle::Connected {
+            return Err(SshError::new(
+                "session_unavailable",
+                "SSH session is not connected",
+                true,
+            ));
+        }
+
+        let mut ssh_handle = connect_client(&entry.target).await?;
+        authenticate_client(&mut ssh_handle, &entry.target).await?;
+        ssh_handle
+            .channel_open_direct_tcpip(
+                host_to_connect,
+                u32::from(port_to_connect),
+                originator_address,
+                u32::from(originator_port),
+            )
+            .await
+            .map_err(map_russh_error)
+    }
+
+    pub async fn has_session(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
+    }
+
     async fn insert_session(
         &self,
         session_id: &str,

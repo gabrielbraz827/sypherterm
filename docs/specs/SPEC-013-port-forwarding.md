@@ -1,6 +1,6 @@
 # SPEC-013 - Port forwarding
 
-Status: Draft
+Status: Done
 Prioridade: P1
 Fonte: README.md
 
@@ -49,6 +49,7 @@ type TunnelRequest = {
   targetHost?: string;
   targetPort?: number;
   label?: string;
+  allowExternalBind?: boolean;
 };
 
 type TunnelStatus = {
@@ -70,7 +71,7 @@ type TunnelStatus = {
 
 | Incremento | Escopo | Status esperado |
 | --- | --- | --- |
-| TUN-1 | Local forwarding em sessao SSH ativa | Primeiro incremento implementavel |
+| TUN-1 | Local forwarding em sessao SSH ativa | Implementado |
 | TUN-2 | Local forwarding iniciando a partir de perfil salvo | Depois de perfis/vault estaveis |
 | TUN-3 | Remote forwarding | Depende da crate SSH |
 | TUN-4 | Dynamic/SOCKS forwarding | Depende da crate SSH e UX de seguranca |
@@ -94,6 +95,15 @@ type TunnelStatus = {
 6. Adicionar cleanup automatico ao fechar sessao.
 7. Expandir para remote/dynamic conforme crate SSH.
 
+## Implementacao entregue
+
+- `TunnelRegistry` gerencia tunnels locais em memoria, associados a `sessionId`.
+- `start_tunnel`, `stop_tunnel`, `list_tunnels` e `list_session_tunnels` usam implementacao real para `mode: "local"`.
+- Cada conexao recebida no bind local abre um canal SSH `direct-tcpip` via `russh`; o trafego nao passa pelo frontend, IPC ou WebSocket do terminal.
+- `disconnect_session` solicita parada dos tunnels da sessao antes de encerrar o shell.
+- A UI ganhou painel para iniciar/parar tunnels locais e o indicador de tunnels passou a refletir tunnels ativos.
+- Bind externo exige confirmacao no frontend e `allowExternalBind` no comando.
+
 ## Criterios de aceite
 
 - Tunnel local encaminha trafego.
@@ -111,8 +121,12 @@ type TunnelStatus = {
 - Teste manual de erro de porta ocupada.
 - Teste manual de cleanup ao desconectar sessao.
 - Teste manual de tentativa de bind externo.
+- Unit tests para validacao de bind externo e campos obrigatorios.
 
 ## Riscos e decisoes abertas
 
+- Decisao: TUN-1 foi implementado primeiro; TUN-2, TUN-3 e TUN-4 seguem adiados.
+- Decisao: tunnels locais usam uma conexao SSH separada derivada da `sessionId` ativa para cada conexao TCP aceita, preservando a sessao shell do terminal.
 - Remote/dynamic forwarding podem depender fortemente da crate SSH.
 - UX deve deixar claro que tunnel ativo expoe uma porta local enquanto estiver rodando.
+- Risco: cleanup automatico cobre `disconnect_session` e monitoramento de sessao no accept loop; quedas abruptas ainda precisam validacao manual contra hosts reais.

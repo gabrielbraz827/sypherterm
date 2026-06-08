@@ -1,6 +1,6 @@
 # SPEC-014 - Snippet organizer
 
-Status: Draft
+Status: Implementada
 Prioridade: P2
 Fonte: README.md
 
@@ -27,6 +27,7 @@ Usuarios repetem comandos, scripts curtos e blocos de configuracao. Snippets aum
 | Comando | Entrada | Saida | Erros |
 | --- | --- | --- | --- |
 | `list_snippets` | filtros opcionais | `SnippetSummary[]` | `vault_locked` |
+| `get_snippet` | `{ id: string }` | `Snippet` | `vault_locked`, `not_found` |
 | `save_snippet` | `SnippetDraft` | `Snippet` | `vault_locked`, `validation_error` |
 | `delete_snippet` | `{ id: string }` | `{ deleted: boolean }` | `not_found` |
 
@@ -43,7 +44,24 @@ type Snippet = {
   createdAt: string;
   updatedAt: string;
 };
+
+type SnippetDraft = {
+  id?: string;
+  name: string;
+  body: string;
+  tags?: string[];
+  variables?: string[];
+};
+
+type SnippetSummary = Omit<Snippet, "body">;
+
+type SnippetFilters = {
+  query?: string;
+  tag?: string;
+};
 ```
+
+Variaveis usam sintaxe minima `{{variable_name}}`, aceitando letras, numeros, `_` e `-`.
 
 ## Seguranca e privacidade
 
@@ -53,11 +71,11 @@ type Snippet = {
 
 ## Plano de implementacao
 
-1. Definir modelo e validacao.
-2. Persistir snippets no vault.
-3. Criar busca por nome/tag.
-4. Criar painel de snippets.
-5. Implementar insercao no terminal ativo.
+1. [x] Definir modelo e validacao.
+2. [x] Persistir snippets no vault.
+3. [x] Criar busca por nome/tag.
+4. [x] Criar painel de snippets.
+5. [x] Implementar insercao no terminal ativo.
 
 ## Criterios de aceite
 
@@ -74,4 +92,7 @@ type Snippet = {
 
 ## Riscos e decisoes abertas
 
-- Definir sintaxe minima de variaveis.
+- Decidido: listagem retorna `SnippetSummary` sem `body`; `get_snippet` recupera o corpo apenas sob acao explicita de editar/inserir.
+- Decidido: sintaxe minima de variaveis e `{{variable_name}}`.
+- Decidido: insercao substitui variaveis via prompt local e nao envia Enter automaticamente.
+- Teste manual de insercao depende de sessao SSH ativa.

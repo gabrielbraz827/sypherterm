@@ -11,18 +11,25 @@
     duplicateProfile,
     getAppStatus,
     getPreferences,
+    getSnippet,
     lockVault,
+    listSnippets,
+    listTunnels,
     listSyncVersions,
     listProfiles,
     savePreferences,
     saveProfile,
+    saveSnippet,
     sftpCancelTransfer,
+    deleteSnippet,
     sftpDelete,
     sftpDownload,
     sftpListDir,
     sftpMkdir,
     sftpRename,
     sftpUpload,
+    startTunnel,
+    stopTunnel,
     testSyncProvider,
     triggerCloudSync,
     unlockVault,
@@ -31,7 +38,9 @@
     type RemoteDirEntry,
     type SyncProviderConfig,
     type SyncVersion,
+    type SnippetSummary,
     type TransferJob,
+    type TunnelStatus,
     type UserPreferences,
     type VaultStatus,
   } from './lib/api';
@@ -93,6 +102,26 @@
   let sftpSelectedKind: RemoteDirEntry['kind'] | undefined = undefined;
   let sftpJob: TransferJob | null = null;
   let isSftpBusy = false;
+  let tunnels: TunnelStatus[] = [];
+  let tunnelBindHost = '127.0.0.1';
+  let tunnelBindPort = 8080;
+  let tunnelTargetHost = '127.0.0.1';
+  let tunnelTargetPort = 80;
+  let tunnelLabel = '';
+  let tunnelError = '';
+  let tunnelMessage = '';
+  let isTunnelBusy = false;
+  let snippets: SnippetSummary[] = [];
+  let snippetSearch = '';
+  let snippetTagFilter = '';
+  let snippetName = '';
+  let snippetBody = '';
+  let snippetTags = '';
+  let snippetVariables = '';
+  let editingSnippetId = '';
+  let snippetError = '';
+  let snippetMessage = '';
+  let isSnippetBusy = false;
   let masterPassword = '';
   let currentPassword = '';
   let newPassword = '';
@@ -121,6 +150,7 @@
   let layoutReady = false;
   let paneConnections: Record<string, TerminalConnection | undefined> = {};
   let paneStatuses: Record<string, { state: string; message?: string }> = {};
+  let terminalPaneRefs: Record<string, { insertText: (text: string) => void } | undefined> = {};
 
   const statusLabel: Record<AppStatus['vault'] | AppStatus['dataPlane'] | UserPreferences['theme'], string> = {
     missing: 'Missing',
@@ -153,6 +183,10 @@
     : undefined;
   $: activeSessionId = activePane?.sessionId ?? '';
   $: activePaneStatus = paneStatuses[activePaneId] ?? { state: 'idle', message: '' };
+  $: activeTunnelCount = tunnels.filter((tunnel) => tunnel.state === 'running').length;
+  $: allSnippetTags = Array.from(new Set(snippets.flatMap((snippet) => snippet.tags))).sort((left, right) =>
+    left.localeCompare(right),
+  );
   $: if (layoutReady) {
     persistSessionLayout(sessionLayout);
   }
@@ -179,6 +213,10 @@
     vaultStatusStore.set(vaultStatus);
     profilesStore.set(storedProfiles);
     preferencesStore.set(storedPreferences);
+    await loadTunnels();
+    if (status.vault === 'unlocked') {
+      await loadSnippetList();
+    }
 
     if (!selectedProfileId && storedProfiles[0]) {
       selectProfile(storedProfiles[0]);
@@ -208,6 +246,7 @@
       vaultStatus = await createVault({ masterPassword });
       vaultStatusStore.set(vaultStatus);
       await refreshStatus();
+      await loadSnippetList();
       vaultMessage = 'Vault created and unlocked.';
     } catch (error) {
       vaultError = formatError(error);
@@ -224,6 +263,7 @@
       vaultStatus = await unlockVault({ masterPassword });
       vaultStatusStore.set(vaultStatus);
       await refreshStatus();
+      await loadSnippetList();
       vaultMessage = 'Vault unlocked.';
     } catch (error) {
       vaultError = formatError(error);
@@ -240,6 +280,8 @@
       vaultStatus = await lockVault();
       vaultStatusStore.set(vaultStatus);
       await refreshStatus();
+      snippets = [];
+      resetSnippetForm();
       vaultMessage = 'Vault locked.';
     } catch (error) {
       vaultError = formatError(error);
@@ -257,6 +299,7 @@
       });
       vaultStatusStore.set(vaultStatus);
       await refreshStatus();
+      await loadSnippetList();
       vaultMessage = 'Master password changed.';
     } catch (error) {
       vaultError = formatError(error);
@@ -777,6 +820,210 @@
     return `${percent}% - ${job.bytesTransferred}/${job.totalBytes} bytes`;
   }
 
+  async function loadSnippetList() {
+    snippetError = '';
+    try {
+      snippets = await listSnippets({
+        query: snippetSearch || undefined,
+        tag: snippetTagFilter || undefined,
+      });
+    } catch (error) {
+      if (commandErrorCode(error) === 'vault_locked') {
+        snippets = [];
+      }
+      snippetError = formatError(error);
+    }
+  }
+
+  async function submitSnippet() {
+    snippetError = '';
+    snippetMessage = '';
+    isSnippetBusy = true;
+
+    try {
+      await saveSnippet({
+        id: editingSnippetId || undefined,
+        name: snippetName,
+        body: snippetBody,
+        tags: splitList(snippetTags),
+        variables: snippetVariables.trim() ? splitList(snippetVariables) : undefined,
+      });
+      resetSnippetForm();
+      await loadSnippetList();
+      snippetMessage = 'Snippet saved.';
+    } catch (error) {
+      snippetError = formatError(error);
+    } finally {
+      isSnippetBusy = false;
+    }
+  }
+
+  async function editSnippet(id: string) {
+    snippetError = '';
+    snippetMessage = '';
+
+    try {
+      const snippet = await getSnippet(id);
+      editingSnippetId = snippet.id;
+      snippetName = snippet.name;
+      snippetBody = snippet.body;
+      snippetTags = snippet.tags.join(', ');
+      snippetVariables = snippet.variables.join(', ');
+    } catch (error) {
+      snippetError = formatError(error);
+    }
+  }
+
+  async function removeSnippet(id: string) {
+    snippetError = '';
+    snippetMessage = '';
+    const shouldDelete = window.confirm('Delete this snippet?');
+    if (!shouldDelete) {
+      return;
+    }
+
+    isSnippetBusy = true;
+    try {
+      await deleteSnippet(id);
+      if (editingSnippetId === id) {
+        resetSnippetForm();
+      }
+      await loadSnippetList();
+      snippetMessage = 'Snippet deleted.';
+    } catch (error) {
+      snippetError = formatError(error);
+    } finally {
+      isSnippetBusy = false;
+    }
+  }
+
+  async function insertSnippet(id: string) {
+    snippetError = '';
+    snippetMessage = '';
+
+    if (!activeSessionId || activePaneStatus.state !== 'connected') {
+      snippetError = 'Select a connected terminal session first.';
+      return;
+    }
+
+    try {
+      const snippet = await getSnippet(id);
+      const preparedBody = promptSnippetVariables(snippet.body, snippet.variables);
+      if (preparedBody === null) {
+        return;
+      }
+
+      const needsConfirmation = preparedBody.includes('\n') || snippet.variables.length > 0;
+      if (needsConfirmation && !window.confirm('Insert this snippet into the active terminal?')) {
+        return;
+      }
+
+      terminalPaneRefs[activePaneId]?.insertText(preparedBody);
+      snippetMessage = 'Snippet inserted into active terminal.';
+    } catch (error) {
+      snippetError = formatError(error);
+    }
+  }
+
+  function promptSnippetVariables(body: string, variables: string[]) {
+    let result = body;
+
+    for (const variable of variables) {
+      const value = window.prompt(`Value for ${variable}`);
+      if (value === null) {
+        return null;
+      }
+      const pattern = new RegExp(`{{\\s*${escapeRegExp(variable)}\\s*}}`, 'gi');
+      result = result.replace(pattern, value);
+    }
+
+    return result;
+  }
+
+  function resetSnippetForm() {
+    editingSnippetId = '';
+    snippetName = '';
+    snippetBody = '';
+    snippetTags = '';
+    snippetVariables = '';
+  }
+
+  function splitList(value: string) {
+    return value
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  function escapeRegExp(value: string) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  async function loadTunnels() {
+    try {
+      tunnels = await listTunnels();
+    } catch (error) {
+      tunnelError = formatError(error);
+    }
+  }
+
+  async function startLocalTunnel() {
+    tunnelError = '';
+    tunnelMessage = '';
+    if (!activeSessionId) {
+      tunnelError = 'Select a connected terminal session first.';
+      return;
+    }
+
+    const bindHost = tunnelBindHost.trim() || '127.0.0.1';
+    const allowExternalBind = isLoopbackBind(bindHost)
+      ? false
+      : window.confirm('Bind this tunnel to a non-loopback address?');
+    if (!isLoopbackBind(bindHost) && !allowExternalBind) {
+      tunnelError = 'External bind was not confirmed.';
+      return;
+    }
+
+    isTunnelBusy = true;
+    try {
+      const tunnel = await startTunnel({
+        sessionId: activeSessionId,
+        mode: 'local',
+        bindHost,
+        bindPort: tunnelBindPort,
+        targetHost: tunnelTargetHost,
+        targetPort: tunnelTargetPort,
+        label: tunnelLabel || undefined,
+        allowExternalBind,
+      });
+      tunnelMessage = `Tunnel running on ${tunnel.bindHost}:${tunnel.bindPort}.`;
+      await loadTunnels();
+    } catch (error) {
+      tunnelError = formatError(error);
+    } finally {
+      isTunnelBusy = false;
+    }
+  }
+
+  async function stopActiveTunnel(tunnelId: string) {
+    tunnelError = '';
+    tunnelMessage = '';
+    isTunnelBusy = true;
+    try {
+      const tunnel = await stopTunnel(tunnelId);
+      tunnelMessage = `Tunnel ${tunnel.state}.`;
+      await loadTunnels();
+    } catch (error) {
+      tunnelError = formatError(error);
+    } finally {
+      isTunnelBusy = false;
+    }
+  }
+
+  function isLoopbackBind(bindHost: string) {
+    return bindHost === '::1' || bindHost.startsWith('127.');
+  }
+
   function formatError(error: unknown) {
     if (typeof error === 'object' && error && 'message' in error) {
       return String(error.message);
@@ -1061,6 +1308,7 @@
               >
                 {#each flattenTerminalPanes(tab.rootPane) as pane (pane.paneId)}
                   <TerminalPane
+                    bind:this={terminalPaneRefs[pane.paneId]}
                     {pane}
                     active={activePaneId === pane.paneId && sessionLayout.activeTabId === tab.id}
                     connection={paneConnections[pane.paneId]}
@@ -1125,7 +1373,7 @@
                 <span class="truncate text-sypher-text">{activePaneStatus.state}</span>
               </div>
             </div>
-            <TunnelIndicator activeCount={0} />
+            <TunnelIndicator activeCount={activeTunnelCount} />
           </div>
 
           <div class="mt-6 border-t border-sypher-border pt-4">
@@ -1214,6 +1462,120 @@
             {:else}
               <p class="mt-4 rounded-panel border border-sypher-border bg-sypher-surface p-3 text-sm text-sypher-muted">
                 No profile selected
+              </p>
+            {/if}
+          </div>
+
+          <div class="mt-6 border-t border-sypher-border pt-4">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold">Tunnels</h2>
+              <button
+                class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                type="button"
+                on:click={loadTunnels}
+              >
+                Refresh
+              </button>
+            </div>
+
+            <div class="mt-4 space-y-3">
+              <div class="grid grid-cols-[1fr_88px] gap-2">
+                <label class="block text-xs text-sypher-muted">
+                  Bind host
+                  <input
+                    class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={tunnelBindHost}
+                    placeholder="127.0.0.1"
+                  />
+                </label>
+                <label class="block text-xs text-sypher-muted">
+                  Port
+                  <input
+                    class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={tunnelBindPort}
+                    min="1"
+                    max="65535"
+                    type="number"
+                  />
+                </label>
+              </div>
+
+              <div class="grid grid-cols-[1fr_88px] gap-2">
+                <label class="block text-xs text-sypher-muted">
+                  Target host
+                  <input
+                    class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={tunnelTargetHost}
+                    placeholder="127.0.0.1"
+                  />
+                </label>
+                <label class="block text-xs text-sypher-muted">
+                  Port
+                  <input
+                    class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={tunnelTargetPort}
+                    min="1"
+                    max="65535"
+                    type="number"
+                  />
+                </label>
+              </div>
+
+              <label class="block text-xs text-sypher-muted">
+                Label
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={tunnelLabel}
+                  placeholder="local web"
+                />
+              </label>
+
+              <button
+                class="w-full rounded-panel bg-sypher-accent px-3 py-2 text-sm font-semibold text-sypher-bg disabled:opacity-50"
+                type="button"
+                disabled={isTunnelBusy || !activeSessionId}
+                on:click={startLocalTunnel}
+              >
+                Start local tunnel
+              </button>
+            </div>
+
+            {#if tunnels.length > 0}
+              <div class="mt-3 space-y-2">
+                {#each tunnels as tunnel}
+                  <div class="rounded-panel border border-sypher-border bg-sypher-surface p-2 text-xs">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="truncate font-medium">{tunnel.label || `${tunnel.bindHost}:${tunnel.bindPort}`}</span>
+                      <span class="shrink-0 text-sypher-muted">{tunnel.state}</span>
+                    </div>
+                    <p class="mt-1 truncate text-sypher-muted">
+                      {tunnel.bindHost}:{tunnel.bindPort} -> {tunnel.targetHost}:{tunnel.targetPort}
+                    </p>
+                    <div class="mt-2 flex items-center justify-between gap-2">
+                      <span class="truncate text-sypher-muted">{tunnel.sessionId}</span>
+                      {#if tunnel.state === 'running'}
+                        <button
+                          class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-text disabled:opacity-50"
+                          type="button"
+                          disabled={isTunnelBusy}
+                          on:click={() => stopActiveTunnel(tunnel.tunnelId)}
+                        >
+                          Stop
+                        </button>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            {#if tunnelError}
+              <p class="mt-3 rounded-panel border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
+                {tunnelError}
+              </p>
+            {:else if tunnelMessage}
+              <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
+                {tunnelMessage}
               </p>
             {/if}
           </div>
@@ -1370,6 +1732,167 @@
             {:else if sftpMessage}
               <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
                 {sftpMessage}
+              </p>
+            {/if}
+          </div>
+
+          <div class="mt-6 border-t border-sypher-border pt-4">
+            <div class="flex items-center justify-between gap-3">
+              <h2 class="text-sm font-semibold">Snippets</h2>
+              <button
+                class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text disabled:opacity-50"
+                type="button"
+                disabled={vaultStatus?.state !== 'unlocked'}
+                on:click={loadSnippetList}
+              >
+                Refresh
+              </button>
+            </div>
+
+            {#if vaultStatus?.state !== 'unlocked'}
+              <p class="mt-3 rounded-panel border border-sypher-border bg-sypher-surface p-3 text-xs text-sypher-muted">
+                Unlock the vault to use snippets.
+              </p>
+            {:else}
+              <div class="mt-4 space-y-3">
+                <div class="grid grid-cols-[1fr_auto] gap-2">
+                  <input
+                    class="min-w-0 rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                    bind:value={snippetSearch}
+                    placeholder="Search snippets"
+                    on:change={loadSnippetList}
+                  />
+                  <button
+                    class="rounded border border-sypher-border px-3 py-2 text-xs text-sypher-text disabled:opacity-50"
+                    type="button"
+                    disabled={isSnippetBusy}
+                    on:click={loadSnippetList}
+                  >
+                    Search
+                  </button>
+                </div>
+
+                <select
+                  class="w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={snippetTagFilter}
+                  on:change={loadSnippetList}
+                >
+                  <option value="">All tags</option>
+                  {#each allSnippetTags as tag}
+                    <option value={tag}>{tag}</option>
+                  {/each}
+                </select>
+
+                {#if snippets.length > 0}
+                  <div class="max-h-44 space-y-2 overflow-y-auto rounded-panel border border-sypher-border bg-sypher-surface p-2">
+                    {#each snippets as snippet}
+                      <div class="rounded border border-sypher-border p-2 text-xs">
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="truncate font-medium">{snippet.name}</span>
+                          <span class="shrink-0 text-sypher-muted">{snippet.variables.length} vars</span>
+                        </div>
+                        {#if snippet.tags.length > 0}
+                          <p class="mt-1 truncate text-sypher-muted">{snippet.tags.join(', ')}</p>
+                        {/if}
+                        <div class="mt-2 grid grid-cols-3 gap-2">
+                          <button
+                            class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-text disabled:opacity-50"
+                            type="button"
+                            disabled={isSnippetBusy}
+                            on:click={() => insertSnippet(snippet.id)}
+                          >
+                            Insert
+                          </button>
+                          <button
+                            class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-text disabled:opacity-50"
+                            type="button"
+                            disabled={isSnippetBusy}
+                            on:click={() => editSnippet(snippet.id)}
+                          >
+                            Edit
+                          </button>
+                          <button
+                            class="rounded border border-red-900/60 px-2 py-1 text-xs text-red-200 disabled:opacity-50"
+                            type="button"
+                            disabled={isSnippetBusy}
+                            on:click={() => removeSnippet(snippet.id)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+
+                <form class="space-y-3" on:submit|preventDefault={submitSnippet}>
+                  <div class="flex items-center justify-between gap-2">
+                    <h3 class="text-xs font-semibold text-sypher-muted">{editingSnippetId ? 'Edit snippet' : 'New snippet'}</h3>
+                    {#if editingSnippetId}
+                      <button
+                        class="rounded border border-sypher-border px-2 py-1 text-xs text-sypher-muted hover:text-sypher-text"
+                        type="button"
+                        on:click={resetSnippetForm}
+                      >
+                        New
+                      </button>
+                    {/if}
+                  </div>
+
+                  <label class="block text-xs text-sypher-muted">
+                    Name
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={snippetName}
+                      placeholder="Restart service"
+                    />
+                  </label>
+
+                  <label class="block text-xs text-sypher-muted">
+                    Body
+                    <textarea
+                      class="mt-1 h-28 w-full resize-y rounded border border-sypher-border bg-sypher-surface px-3 py-2 font-mono text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={snippetBody}
+                      placeholder="systemctl restart &#123;&#123;service&#125;&#125;"
+                    ></textarea>
+                  </label>
+
+                  <label class="block text-xs text-sypher-muted">
+                    Tags
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={snippetTags}
+                      placeholder="ops, linux"
+                    />
+                  </label>
+
+                  <label class="block text-xs text-sypher-muted">
+                    Variables
+                    <input
+                      class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-xs text-sypher-text outline-none focus:border-sypher-accent"
+                      bind:value={snippetVariables}
+                      placeholder="auto from &#123;&#123;variable&#125;&#125; when empty"
+                    />
+                  </label>
+
+                  <button
+                    class="w-full rounded-panel bg-sypher-accent px-3 py-2 text-sm font-semibold text-sypher-bg disabled:opacity-50"
+                    type="submit"
+                    disabled={isSnippetBusy}
+                  >
+                    {isSnippetBusy ? 'Saving...' : editingSnippetId ? 'Update snippet' : 'Save snippet'}
+                  </button>
+                </form>
+              </div>
+            {/if}
+
+            {#if snippetError}
+              <p class="mt-3 rounded-panel border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
+                {snippetError}
+              </p>
+            {:else if snippetMessage}
+              <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
+                {snippetMessage}
               </p>
             {/if}
           </div>

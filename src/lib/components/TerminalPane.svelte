@@ -28,8 +28,13 @@
     copySelection: () => Promise<void>;
     pasteClipboard: () => Promise<void>;
     clearTerminal: () => void;
+    insertText: (text: string) => void;
     disconnect: () => Promise<void>;
   } | null = null;
+
+  export function insertText(text: string) {
+    terminalRef?.insertText(text);
+  }
 
   async function disconnectPane() {
     await terminalRef?.disconnect();

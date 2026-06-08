@@ -213,6 +213,7 @@ export type TunnelRequest = {
   targetHost?: string;
   targetPort?: number;
   label?: string;
+  allowExternalBind?: boolean;
 };
 
 export type TunnelStatus = {
@@ -227,6 +228,32 @@ export type TunnelStatus = {
   label?: string;
   startedAt?: string;
   lastError?: string;
+};
+
+export type Snippet = {
+  id: string;
+  version: 1;
+  name: string;
+  body: string;
+  tags: string[];
+  variables: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SnippetSummary = Omit<Snippet, 'body'>;
+
+export type SnippetDraft = {
+  id?: string;
+  name: string;
+  body: string;
+  tags?: string[];
+  variables?: string[];
+};
+
+export type SnippetFilters = {
+  query?: string;
+  tag?: string;
 };
 
 function isCommandError(error: unknown): error is CommandError {
@@ -390,4 +417,23 @@ export function listTunnels(): Promise<TunnelStatus[]> {
 
 export function listSessionTunnels(sessionId: string): Promise<TunnelStatus[]> {
   return invokeCommand<TunnelStatus[]>('list_session_tunnels', { sessionId });
+}
+
+export function listSnippets(filters?: SnippetFilters): Promise<SnippetSummary[]> {
+  return invokeCommand<SnippetSummary[]>(
+    'list_snippets',
+    filters ? { filters } : undefined,
+  );
+}
+
+export function getSnippet(id: string): Promise<Snippet> {
+  return invokeCommand<Snippet>('get_snippet', { id });
+}
+
+export function saveSnippet(draft: SnippetDraft): Promise<Snippet> {
+  return invokeCommand<Snippet>('save_snippet', { draft });
+}
+
+export function deleteSnippet(id: string): Promise<DeleteResult> {
+  return invokeCommand<DeleteResult>('delete_snippet', { id });
 }

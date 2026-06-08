@@ -80,6 +80,11 @@
     terminal?.focus();
   }
 
+  export function insertText(text: string) {
+    socket?.sendInput(text);
+    terminal?.focus();
+  }
+
   export async function reconnect() {
     if (!connection) {
       return;

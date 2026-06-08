@@ -10,6 +10,11 @@ use crate::sftp::{
     RemoteDirEntry, SftpCancelRequest, SftpDeleteRequest, SftpError, SftpPathRequest, SftpRegistry,
     SftpRenameRequest, SftpTransferRequest, TransferJob,
 };
+use crate::snippets::{
+    delete_snippet as delete_stored_snippet, get_snippet as get_stored_snippet,
+    list_snippets as list_stored_snippets, save_snippet as save_stored_snippet, Snippet,
+    SnippetDraft, SnippetError, SnippetFilters, SnippetSummary,
+};
 use crate::ssh::{
     ConnectSshRequest, ConnectSshResponse, SessionResizeRequest, SessionStatus, SshError,
     SshRegistry,
@@ -27,8 +32,9 @@ use crate::sync::{
     test_sync_provider as test_configured_sync_provider, trigger_sync as trigger_configured_sync,
     SyncError, SyncJobStatus, SyncProviderConfig, SyncProviderStatus, SyncRequest, SyncVersion,
 };
+use crate::tunnel::{TunnelError, TunnelRegistry, TunnelRequest, TunnelStatus};
 use crate::ws::{DataPlaneSession, StreamServer, StreamServerError};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -45,10 +51,6 @@ impl CommandError {
             message: message.into(),
             recoverable,
         }
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self::new("not_found", message, true)
     }
 }
 
@@ -94,46 +96,16 @@ impl From<SftpError> for CommandError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TunnelRequest {
-    #[allow(dead_code)]
-    pub session_id: Option<String>,
-    #[allow(dead_code)]
-    pub profile_id: Option<String>,
-    #[allow(dead_code)]
-    pub mode: String,
-    #[allow(dead_code)]
-    pub bind_host: String,
-    #[allow(dead_code)]
-    pub bind_port: u16,
-    #[allow(dead_code)]
-    pub target_host: Option<String>,
-    #[allow(dead_code)]
-    pub target_port: Option<u16>,
-    #[allow(dead_code)]
-    pub label: Option<String>,
+impl From<TunnelError> for CommandError {
+    fn from(error: TunnelError) -> Self {
+        Self::new(error.code, error.message, error.recoverable)
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TunnelStatus {
-    pub tunnel_id: String,
-    pub session_id: String,
-    pub mode: String,
-    pub state: String,
-    pub bind_host: String,
-    pub bind_port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_host: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_port: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
+impl From<SnippetError> for CommandError {
+    fn from(error: SnippetError) -> Self {
+        Self::new(error.code, error.message, error.recoverable)
+    }
 }
 
 #[tauri::command]
@@ -220,6 +192,37 @@ pub fn save_preferences(
 }
 
 #[tauri::command]
+pub fn list_snippets(
+    state: State<'_, AppState>,
+    filters: Option<SnippetFilters>,
+) -> Result<Vec<SnippetSummary>, CommandError> {
+    list_stored_snippets(&state, filters).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn get_snippet(state: State<'_, AppState>, id: String) -> Result<Snippet, CommandError> {
+    get_stored_snippet(&state, id).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn save_snippet(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    draft: SnippetDraft,
+) -> Result<Snippet, CommandError> {
+    save_stored_snippet(&app, &state, draft).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn delete_snippet(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<DeleteResult, CommandError> {
+    delete_stored_snippet(&app, &state, id).map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn open_data_plane_session(
     server: State<'_, StreamServer>,
 ) -> Result<DataPlaneSession, CommandError> {
@@ -256,8 +259,10 @@ pub async fn connect_ssh(
 #[tauri::command]
 pub async fn disconnect_session(
     ssh: State<'_, SshRegistry>,
+    tunnels: State<'_, TunnelRegistry>,
     session_id: String,
 ) -> Result<SessionStatus, CommandError> {
+    tunnels.stop_session_tunnels(&session_id).await;
     ssh.disconnect(&session_id).await.map_err(Into::into)
 }
 
@@ -351,31 +356,38 @@ pub fn list_sync_versions(config: SyncProviderConfig) -> Result<Vec<SyncVersion>
 }
 
 #[tauri::command]
-pub fn start_tunnel(request: TunnelRequest) -> Result<TunnelStatus, CommandError> {
-    let _ = request;
-    Err(CommandError::new(
-        "unsupported_mode",
-        "tunnels are defined in the Control Plane but not implemented yet",
-        true,
-    ))
+pub async fn start_tunnel(
+    ssh: State<'_, SshRegistry>,
+    tunnels: State<'_, TunnelRegistry>,
+    request: TunnelRequest,
+) -> Result<TunnelStatus, CommandError> {
+    tunnels.start(&ssh, request).await.map_err(Into::into)
 }
 
 #[tauri::command]
-pub fn stop_tunnel(tunnel_id: String) -> Result<TunnelStatus, CommandError> {
-    Err(CommandError::not_found(format!(
-        "tunnel {tunnel_id} is not active"
-    )))
+pub async fn stop_tunnel(
+    tunnels: State<'_, TunnelRegistry>,
+    tunnel_id: String,
+) -> Result<TunnelStatus, CommandError> {
+    tunnels.stop(tunnel_id).await.map_err(Into::into)
 }
 
 #[tauri::command]
-pub fn list_tunnels() -> Result<Vec<TunnelStatus>, CommandError> {
-    Ok(Vec::new())
+pub async fn list_tunnels(
+    tunnels: State<'_, TunnelRegistry>,
+) -> Result<Vec<TunnelStatus>, CommandError> {
+    Ok(tunnels.list().await)
 }
 
 #[tauri::command]
-pub fn list_session_tunnels(session_id: String) -> Result<Vec<TunnelStatus>, CommandError> {
-    let _ = session_id;
-    Ok(Vec::new())
+pub async fn list_session_tunnels(
+    tunnels: State<'_, TunnelRegistry>,
+    session_id: String,
+) -> Result<Vec<TunnelStatus>, CommandError> {
+    tunnels
+        .list_for_session(session_id)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]

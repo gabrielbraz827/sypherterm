@@ -34,6 +34,7 @@ pub struct AppState {
     vault: Mutex<VaultState>,
     data_plane: Mutex<DataPlaneState>,
     vault_payload: Mutex<Option<Zeroizing<Vec<u8>>>>,
+    vault_key: Mutex<Option<Zeroizing<[u8; 32]>>>,
 }
 
 #[derive(Debug)]
@@ -67,7 +68,9 @@ impl AppState {
         self.set_lock_value(&self.vault, vault_state, "vault")
     }
 
+    #[cfg(test)]
     pub fn unlock_vault_payload(&self, payload: Vec<u8>) -> Result<(), AppStateError> {
+        self.set_lock_value(&self.vault_key, None, "vault_key")?;
         self.set_lock_value(
             &self.vault_payload,
             Some(Zeroizing::new(payload)),
@@ -76,8 +79,31 @@ impl AppState {
         self.set_vault_state(VaultState::Unlocked)
     }
 
+    pub fn unlock_vault_secret(
+        &self,
+        payload: Vec<u8>,
+        key: Zeroizing<[u8; 32]>,
+    ) -> Result<(), AppStateError> {
+        self.set_lock_value(
+            &self.vault_payload,
+            Some(Zeroizing::new(payload)),
+            "vault_payload",
+        )?;
+        self.set_lock_value(&self.vault_key, Some(key), "vault_key")?;
+        self.set_vault_state(VaultState::Unlocked)
+    }
+
+    pub fn update_vault_payload(&self, payload: Vec<u8>) -> Result<(), AppStateError> {
+        self.set_lock_value(
+            &self.vault_payload,
+            Some(Zeroizing::new(payload)),
+            "vault_payload",
+        )
+    }
+
     pub fn lock_vault_payload(&self) -> Result<(), AppStateError> {
         self.set_lock_value(&self.vault_payload, None, "vault_payload")?;
+        self.set_lock_value(&self.vault_key, None, "vault_key")?;
         self.set_vault_state(VaultState::Locked)
     }
 
@@ -94,6 +120,13 @@ impl AppState {
             .lock()
             .map(|guard| guard.as_ref().map(|payload| payload.to_vec()))
             .map_err(|_: PoisonError<_>| AppStateError::LockPoisoned("vault_payload"))
+    }
+
+    pub fn vault_key(&self) -> Result<Option<Zeroizing<[u8; 32]>>, AppStateError> {
+        self.vault_key
+            .lock()
+            .map(|guard| guard.as_ref().cloned())
+            .map_err(|_: PoisonError<_>| AppStateError::LockPoisoned("vault_key"))
     }
 
     fn lock_value<T: Copy>(
@@ -127,6 +160,7 @@ impl Default for AppState {
             vault: Mutex::new(VaultState::Missing),
             data_plane: Mutex::new(DataPlaneState::Stopped),
             vault_payload: Mutex::new(None),
+            vault_key: Mutex::new(None),
         }
     }
 }
