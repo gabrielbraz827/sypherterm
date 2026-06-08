@@ -12,12 +12,17 @@
     getAppStatus,
     getPreferences,
     lockVault,
+    listSyncVersions,
     listProfiles,
     savePreferences,
     saveProfile,
+    testSyncProvider,
+    triggerCloudSync,
     unlockVault,
     type AppStatus,
     type ConnectionProfileSummary,
+    type SyncProviderConfig,
+    type SyncVersion,
     type UserPreferences,
     type VaultStatus,
   } from './lib/api';
@@ -58,6 +63,13 @@
   let formError = '';
   let vaultError = '';
   let vaultMessage = '';
+  let syncPath = '';
+  let syncDeviceId = '';
+  let syncDirection: 'push' | 'pull' | 'bidirectional' = 'bidirectional';
+  let syncMessage = '';
+  let syncError = '';
+  let syncVersions: SyncVersion[] = [];
+  let isSyncing = false;
   let masterPassword = '';
   let currentPassword = '';
   let newPassword = '';
@@ -480,12 +492,101 @@
     }
   }
 
+  function syncConfig(): SyncProviderConfig | null {
+    const localPath = syncPath.trim();
+    if (!localPath) {
+      syncError = 'Local sync path is required.';
+      return null;
+    }
+
+    return {
+      providerId: localPath,
+      kind: 'local',
+      localPath,
+      deviceId: syncDeviceId.trim() || undefined,
+    };
+  }
+
+  async function testSyncConfig() {
+    syncError = '';
+    syncMessage = '';
+    const config = syncConfig();
+    if (!config) {
+      return;
+    }
+
+    try {
+      const status = await testSyncProvider(config);
+      syncMessage = `Provider ${status.state}: ${status.rootPath}`;
+    } catch (error) {
+      syncError = formatError(error);
+    }
+  }
+
+  async function runSync() {
+    syncError = '';
+    syncMessage = '';
+    const config = syncConfig();
+    if (!config) {
+      return;
+    }
+
+    isSyncing = true;
+    try {
+      const status = await triggerCloudSync({
+        providerId: config.providerId,
+        direction: syncDirection,
+        deviceId: config.deviceId,
+      });
+      syncMessage = [status.state, status.message, status.versionId ? `Version ${status.versionId}` : '']
+        .filter(Boolean)
+        .join(' - ');
+      await loadSyncVersionList(false);
+      await refreshStatus();
+    } catch (error) {
+      syncError = formatError(error);
+    } finally {
+      isSyncing = false;
+    }
+  }
+
+  async function loadSyncVersionList(showMessage = true) {
+    syncError = '';
+    const config = syncConfig();
+    if (!config) {
+      return;
+    }
+
+    try {
+      syncVersions = await listSyncVersions(config);
+      if (showMessage) {
+        syncMessage = syncVersions.length ? `${syncVersions.length} sync version(s)` : 'No sync versions yet.';
+      }
+    } catch (error) {
+      syncError = formatError(error);
+    }
+  }
+
   function formatError(error: unknown) {
     if (typeof error === 'object' && error && 'message' in error) {
       return String(error.message);
     }
 
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function shortHash(value: string) {
+    return value.length > 16 ? `${value.slice(0, 16)}...` : value;
+  }
+
+  function formatSyncDate(createdAt: string) {
+    const seconds = Number(createdAt);
+    if (!Number.isFinite(seconds)) {
+      return createdAt;
+    }
+
+    const date = new Date(seconds * 1000);
+    return Number.isNaN(date.getTime()) ? createdAt : date.toLocaleString();
   }
 
   function filteredProfiles(
@@ -993,6 +1094,94 @@
               <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
                 {vaultMessage}
               </p>
+            {/if}
+          </div>
+
+          <div class="mt-6 border-t border-sypher-border pt-4">
+            <h2 class="text-sm font-semibold">Sync</h2>
+
+            <div class="mt-4 space-y-3">
+              <label class="block text-xs text-sypher-muted">
+                Local provider path
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={syncPath}
+                  placeholder="C:/Users/me/SypherTermSync"
+                />
+              </label>
+
+              <label class="block text-xs text-sypher-muted">
+                Device id
+                <input
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={syncDeviceId}
+                  placeholder="workstation"
+                />
+              </label>
+
+              <label class="block text-xs text-sypher-muted">
+                Direction
+                <select
+                  class="mt-1 w-full rounded border border-sypher-border bg-sypher-surface px-3 py-2 text-sm text-sypher-text outline-none focus:border-sypher-accent"
+                  bind:value={syncDirection}
+                >
+                  <option value="bidirectional">Bidirectional</option>
+                  <option value="push">Push</option>
+                  <option value="pull">Pull</option>
+                </select>
+              </label>
+
+              <div class="grid grid-cols-3 gap-2">
+                <button
+                  class="rounded-panel border border-sypher-border px-2 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  on:click={testSyncConfig}
+                  disabled={isSyncing}
+                >
+                  Test
+                </button>
+                <button
+                  class="rounded-panel bg-sypher-accent px-2 py-2 text-xs font-semibold text-sypher-bg disabled:opacity-50"
+                  type="button"
+                  on:click={runSync}
+                  disabled={isSyncing}
+                >
+                  {isSyncing ? 'Syncing' : 'Sync'}
+                </button>
+                <button
+                  class="rounded-panel border border-sypher-border px-2 py-2 text-xs text-sypher-text disabled:opacity-50"
+                  type="button"
+                  on:click={() => loadSyncVersionList()}
+                  disabled={isSyncing}
+                >
+                  Versions
+                </button>
+              </div>
+            </div>
+
+            {#if syncError}
+              <p class="mt-3 rounded-panel border border-red-900/60 bg-red-950/40 p-2 text-xs text-red-200">
+                {syncError}
+              </p>
+            {:else if syncMessage}
+              <p class="mt-3 rounded-panel border border-emerald-900/60 bg-emerald-950/40 p-2 text-xs text-emerald-200">
+                {syncMessage}
+              </p>
+            {/if}
+
+            {#if syncVersions.length > 0}
+              <div class="mt-3 space-y-2">
+                {#each syncVersions as version}
+                  <div class="rounded-panel border border-sypher-border bg-sypher-surface p-2 text-xs">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="truncate font-medium">{version.deviceId}</span>
+                      <span class="shrink-0 text-sypher-muted">{formatSyncDate(version.createdAt)}</span>
+                    </div>
+                    <p class="mt-1 truncate text-sypher-muted">{version.versionId}</p>
+                    <p class="mt-1 truncate text-sypher-muted">{shortHash(version.payloadHash)}</p>
+                  </div>
+                {/each}
+              </div>
             {/if}
           </div>
 

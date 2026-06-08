@@ -223,6 +223,28 @@ pub fn vault_status<R: Runtime>(
     }
 }
 
+pub fn export_vault_envelope<R: Runtime>(app: &AppHandle<R>) -> Result<VaultEnvelope, VaultError> {
+    load_envelope(app)?
+        .ok_or_else(|| VaultError::new("vault_locked", "vault has not been created", true))
+}
+
+pub fn import_vault_envelope<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    envelope: VaultEnvelope,
+) -> Result<VaultStatus, VaultError> {
+    validate_envelope(&envelope)?;
+    let store = app.store(STORE_PATH)?;
+    store.set(VAULT_KEY, serde_json::to_value(&envelope)?);
+    store.save()?;
+    state.lock_vault_payload()?;
+
+    Ok(VaultStatus {
+        state: VaultState::Locked,
+        version: Some(envelope.version),
+    })
+}
+
 fn encrypt_payload_with_created_at(
     data: &[u8],
     master_password: &str,

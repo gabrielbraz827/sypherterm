@@ -120,11 +120,38 @@ export type SessionStatus = {
 export type SyncRequest = {
   providerId: string;
   direction: 'push' | 'pull' | 'bidirectional' | string;
+  deviceId?: string;
+};
+
+export type SyncProviderKind = 'local';
+
+export type SyncProviderConfig = {
+  providerId: string;
+  kind: SyncProviderKind;
+  localPath: string;
+  deviceId?: string;
+};
+
+export type SyncProviderStatus = {
+  providerId: string;
+  kind: string;
+  state: string;
+  rootPath: string;
 };
 
 export type SyncJobStatus = {
   jobId: string;
   state: string;
+  versionId?: string;
+  payloadHash?: string;
+  message?: string;
+};
+
+export type SyncVersion = {
+  versionId: string;
+  deviceId: string;
+  payloadHash: string;
+  createdAt: string;
 };
 
 export type TunnelRequest = {
@@ -261,6 +288,14 @@ export function resizeSession(request: SessionResizeRequest): Promise<SessionSta
 
 export function triggerCloudSync(request: SyncRequest): Promise<SyncJobStatus> {
   return invokeCommand<SyncJobStatus>('trigger_cloud_sync', { request });
+}
+
+export function testSyncProvider(config: SyncProviderConfig): Promise<SyncProviderStatus> {
+  return invokeCommand<SyncProviderStatus>('test_sync_provider', { config });
+}
+
+export function listSyncVersions(config: SyncProviderConfig): Promise<SyncVersion[]> {
+  return invokeCommand<SyncVersion[]>('list_sync_versions', { config });
 }
 
 export function startTunnel(request: TunnelRequest): Promise<TunnelStatus> {

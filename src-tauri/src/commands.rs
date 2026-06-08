@@ -18,6 +18,11 @@ use crate::storage::{
     save_profile as save_stored_profile, ConnectionProfile, ConnectionProfileDraft,
     ConnectionProfileSummary, DeleteResult, ProfileListFilters, StorageError, UserPreferences,
 };
+use crate::sync::{
+    list_sync_versions as list_provider_sync_versions,
+    test_sync_provider as test_configured_sync_provider, trigger_sync as trigger_configured_sync,
+    SyncError, SyncJobStatus, SyncProviderConfig, SyncProviderStatus, SyncRequest, SyncVersion,
+};
 use crate::ws::{DataPlaneSession, StreamServer, StreamServerError};
 use serde::{Deserialize, Serialize};
 
@@ -36,14 +41,6 @@ impl CommandError {
             message: message.into(),
             recoverable,
         }
-    }
-
-    fn not_implemented(feature: &str) -> Self {
-        Self::new(
-            "not_implemented",
-            format!("{feature} is defined in the Control Plane but not implemented yet"),
-            true,
-        )
     }
 
     fn not_found(message: impl Into<String>) -> Self {
@@ -81,20 +78,10 @@ impl From<SshError> for CommandError {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncRequest {
-    #[allow(dead_code)]
-    pub provider_id: String,
-    #[allow(dead_code)]
-    pub direction: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncJobStatus {
-    pub job_id: String,
-    pub state: String,
+impl From<SyncError> for CommandError {
+    fn from(error: SyncError) -> Self {
+        Self::new(error.code, error.message, error.recoverable)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,9 +260,22 @@ pub async fn resize_session(
 }
 
 #[tauri::command]
-pub fn trigger_cloud_sync(request: SyncRequest) -> Result<SyncJobStatus, CommandError> {
-    let _ = request;
-    Err(CommandError::not_implemented("cloud sync"))
+pub fn test_sync_provider(config: SyncProviderConfig) -> Result<SyncProviderStatus, CommandError> {
+    test_configured_sync_provider(config).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn trigger_cloud_sync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: SyncRequest,
+) -> Result<SyncJobStatus, CommandError> {
+    trigger_configured_sync(&app, &state, request).map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn list_sync_versions(config: SyncProviderConfig) -> Result<Vec<SyncVersion>, CommandError> {
+    list_provider_sync_versions(config).map_err(Into::into)
 }
 
 #[tauri::command]
